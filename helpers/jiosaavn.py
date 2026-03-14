@@ -223,7 +223,8 @@ async def search_albums(query: str, limit: int = 20) -> list[dict]:
                     "duration":    0,
                     "source":      "jiosaavn",
                     "result_type": "album",
-                    "album_query": f"{alb} {s.get('artist','')}".strip(),
+                    # album_query used to search songs for this album
+                    "album_query": f"{alb} {s.get('artist','').split(',')[0].strip()}".strip(),
                 })
     return albums[:limit]
 

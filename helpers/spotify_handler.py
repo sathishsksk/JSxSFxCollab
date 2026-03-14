@@ -507,6 +507,16 @@ async def download_spotify_track(song: dict, quality: str = "320") -> tuple[str,
 
 # ── YouTube search (for search results UI) ────────────────────────────────────
 async def search_youtube(query: str, limit: int = MAX_SEARCH_RESULTS) -> list[dict]:
+    """
+    Search YouTube for music only.
+    - Appends 'song' to the query so YouTube prioritises music uploads
+    - Filters out non-music by duration: skips anything under 60s (trailers/clips)
+      and over 900s (concerts/movies)
+    - Fetches extra results to compensate for filtered-out items
+    """
+    music_query = f"{query} song"
+    fetch_limit = limit * 3   # fetch more to filter down
+
     opts = {
         "quiet":         True,
         "no_warnings":   True,
@@ -522,26 +532,41 @@ async def search_youtube(query: str, limit: int = MAX_SEARCH_RESULTS) -> list[di
     try:
         def _run():
             with yt_dlp.YoutubeDL(opts) as ydl:
-                return ydl.extract_info(f"ytsearch{limit}:{query}", download=False)
+                return ydl.extract_info(f"ytsearch{fetch_limit}:{music_query}", download=False)
         info = await loop.run_in_executor(None, _run)
         if not info:
             return []
+
         results = []
         for e in (info.get("entries") or []):
             if not e:
                 continue
+            duration = int(e.get("duration") or 0)
+            # Skip trailers (<60s), live streams (duration=0 after live), long videos (>15min)
+            if duration > 0 and (duration < 60 or duration > 900):
+                continue
+            # Skip obvious non-music by title keywords
+            title_lower = (e.get("title") or "").lower()
+            if any(kw in title_lower for kw in
+                   ("trailer", "teaser", "official trailer", "behind the scenes",
+                    "interview", "reaction", "review", "explained")):
+                continue
+
             vid_id = e.get("id") or ""
             results.append({
                 "title":    e.get("title") or "Unknown",
                 "artist":   e.get("uploader") or e.get("channel") or "",
                 "album":    "",
                 "image":    e.get("thumbnail") or "",
-                "duration": int(e.get("duration") or 0),
+                "duration": duration,
                 "search":   f"https://youtu.be/{vid_id}" if vid_id else e.get("url", ""),
                 "lyrics":   "",
                 "source":   "youtube",
             })
-        return results[:limit]
+            if len(results) >= limit:
+                break
+
+        return results
     except Exception as e:
         log.error(f"YouTube search error: {e}")
         return []
