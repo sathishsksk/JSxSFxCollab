@@ -9,6 +9,7 @@ import unicodedata
 from pathlib import Path
 from math import ceil
 
+import aiohttp
 from aiohttp import web
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputFile
 from telegram.ext import (
@@ -120,7 +121,29 @@ async def _dl_send_yt(context, chat_id, song: dict, quality: str):
     target = song.get("search") or f"{song.get('title','')} {song.get('artist','')}".strip()
     path   = await download_yt(target, meta=song, quality=quality)
     if not path:
-        raise RuntimeError("Download failed — video unavailable or region-locked")
+        # Final fallback — try JioSaavn for this song
+        title  = song.get("title","")
+        artist = song.get("artist","")
+        if title:
+            from helpers.jiosaavn import search_songs as _jio_s, download_and_encode as _jio_dl
+            try:
+                results = await _jio_s(f"{title} {artist}".strip(), quality=quality, limit=1)
+                if results:
+                    jio = results[0]
+                    jio["quality"] = quality
+                    path = await _jio_dl(jio)
+                    lyrics = jio.get("lyrics") or ""
+                    await tag_mp3(path, jio, lyrics=lyrics)
+                    await send_audio(context, chat_id, path, jio, quality)
+                    cleanup(path)
+                    return
+            except Exception as e:
+                log.warning(f"JioSaavn fallback also failed: {e}")
+        raise RuntimeError(
+            "Could not download this track.\n"
+            "YouTube is blocking cloud server IPs for this video.\n"
+            "Try sending the JioSaavn link directly for Indian songs."
+        )
     lyrics = await get_lyrics(song.get("title",""), song.get("artist",""))
     await tag_mp3(path, song, lyrics=lyrics)
     await send_audio(context, chat_id, path, song, quality)
