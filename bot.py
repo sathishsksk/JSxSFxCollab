@@ -74,13 +74,22 @@ async def send_audio(context, chat_id, filepath, meta, quality):
     artist   = meta.get("artist") or ""
     album    = meta.get("album") or ""
     duration = int(meta.get("duration") or 0)
-    caption  = (
-        f"*{title}*\n"
-        + (f"_{artist}_\n" if artist else "")
-        + (f"{album}\n"    if album  else "")
-        + (f"{human_dur(duration)}  •  {quality} kbps" if duration else f"{quality} kbps")
-        + f"\n\nvia @{BOT_ID}"
-    )
+    year     = meta.get("year") or ""
+    source   = meta.get("source") or ""
+
+    src_tag = {"jiosaavn": "🎵 JioSaavn", "spotify": "💚 Spotify", "youtube": "▶️ YouTube"}.get(source, "")
+
+    caption = f"🎧  *{title}*\n"
+    if artist:  caption += f"👤  {artist}\n"
+    if album:   caption += f"💿  {album}\n"
+    if year:    caption += f"📅  {year}\n"
+    if duration:
+        caption += f"⏱  {human_dur(duration)}   ·   🎚 {quality} kbps\n"
+    else:
+        caption += f"🎚  {quality} kbps\n"
+    caption += f"\n🔗  via @{BOT_ID}"
+    if src_tag: caption += f"  ·  {src_tag}"
+
     await context.bot.send_chat_action(chat_id, ChatAction.UPLOAD_VOICE)
     fname = f"{artist} - {title}.mp3" if artist else f"{title}.mp3"
     with open(filepath, "rb") as f:
@@ -496,7 +505,7 @@ async def on_search_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
 #  DOWNLOAD PIPELINES
 # ══════════════════════════════════════════════════════════════════════════════
 async def run_jiosaavn(context, chat_id, url, kind, quality):
-    status = await context.bot.send_message(chat_id, "Fetching from JioSaavn…")
+    status = await context.bot.send_message(chat_id, "⏳  Fetching from JioSaavn…")
     try:
         if kind == "song":       songs = await fetch_song(url, quality)
         elif kind == "album":    songs = await fetch_album(url, quality)
@@ -504,11 +513,11 @@ async def run_jiosaavn(context, chat_id, url, kind, quality):
         else:                    songs = await fetch_song(url, quality)
 
         if not songs:
-            await status.edit_text("No results from JioSaavn. The link may be invalid.")
+            await status.edit_text("😕  No results from JioSaavn. The link may be invalid.")
             return
 
         total = min(len(songs), MAX_PLAYLIST_SONGS)
-        await status.edit_text(f"Downloading {total} track(s) at {quality} kbps…")
+        await status.edit_text(f"⬇️  Downloading {total} track{'s' if total>1 else ''} at {quality} kbps…")
         for song in songs[:MAX_PLAYLIST_SONGS]:
             try:
                 await _dl_send_jio(context, chat_id, song, quality)
@@ -517,28 +526,28 @@ async def run_jiosaavn(context, chat_id, url, kind, quality):
                 log.error(f"JioSaavn song error: {e}")
                 await context.bot.send_message(
                     chat_id,
-                    f"Skipped *{song.get('title','?')}*\n`{type(e).__name__}: {e}`",
+                    f"⚠️  Skipped *{song.get('title','?')}*\n`{type(e).__name__}: {e}`",
                     parse_mode=ParseMode.MARKDOWN,
                 )
         await status.delete()
     except Exception as e:
         log.error(f"JioSaavn pipeline: {e}")
-        await status.edit_text(f"Something went wrong.\n`{e}`", parse_mode=ParseMode.MARKDOWN)
+        await status.edit_text(f"❌  Something went wrong.\n`{e}`", parse_mode=ParseMode.MARKDOWN)
 
 
 async def run_spotify(context, chat_id, url, kind, quality):
-    status = await context.bot.send_message(chat_id, "Reading Spotify info…")
+    status = await context.bot.send_message(chat_id, "⏳  Reading Spotify info…")
     try:
         tracks, err = await spotify_scrape(url, kind)
         if err or not tracks:
             await status.edit_text(
-                f"Couldn't read Spotify info.\n`{err or 'No tracks found'}`",
+                f"❌  Couldn't read Spotify info.\n`{err or 'No tracks found'}`",
                 parse_mode=ParseMode.MARKDOWN,
             )
             return
 
         total = min(len(tracks), MAX_PLAYLIST_SONGS)
-        await status.edit_text(f"Downloading {total} track(s) at {quality} kbps…")
+        await status.edit_text(f"⬇️  Downloading {total} track{'s' if total>1 else ''} at {quality} kbps…")
 
         for track in tracks[:MAX_PLAYLIST_SONGS]:
             try:
@@ -548,21 +557,21 @@ async def run_spotify(context, chat_id, url, kind, quality):
                 log.error(f"Spotify track error: {e}")
                 await context.bot.send_message(
                     chat_id,
-                    f"Skipped *{track.get('title','?')}*\n`{type(e).__name__}: {e}`",
+                    f"⚠️  Skipped *{track.get('title','?')}*\n`{type(e).__name__}: {e}`",
                     parse_mode=ParseMode.MARKDOWN,
                 )
         await status.delete()
     except Exception as e:
         log.error(f"Spotify pipeline: {e}")
-        await status.edit_text(f"Something went wrong.\n`{e}`", parse_mode=ParseMode.MARKDOWN)
+        await status.edit_text(f"❌  Something went wrong.\n`{e}`", parse_mode=ParseMode.MARKDOWN)
 
 
 async def run_youtube(context, chat_id, url, quality):
-    status = await context.bot.send_message(chat_id, "Downloading from YouTube…")
+    status = await context.bot.send_message(chat_id, "⏳  Downloading from YouTube…")
     try:
         path = await download_yt(url, quality=quality)
         if not path:
-            await status.edit_text("Download failed. The video may be unavailable.")
+            await status.edit_text("❌  Download failed. The video may be unavailable.")
             return
         stem = Path(path).stem.replace(f"_{quality}kbps", "")
         meta = {"title": stem, "artist": "", "album": "", "duration": 0}
@@ -572,7 +581,7 @@ async def run_youtube(context, chat_id, url, quality):
         await status.delete()
     except Exception as e:
         log.error(f"YouTube pipeline: {e}")
-        await status.edit_text(f"Something went wrong.\n`{e}`", parse_mode=ParseMode.MARKDOWN)
+        await status.edit_text(f"❌  Something went wrong.\n`{e}`", parse_mode=ParseMode.MARKDOWN)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -588,12 +597,12 @@ async def on_quality(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     payload = context.bot_data.pop(key, None)
     if not payload:
-        await cb.edit_message_text("Session expired. Please send the link again.")
+        await cb.edit_message_text("⏰  Session expired. Please send the link again.")
         return
 
     try:
         await cb.edit_message_text(
-            f"Starting download at *{quality} kbps*…", parse_mode=ParseMode.MARKDOWN
+            f"⬇️  Grabbing it at *{quality} kbps*…", parse_mode=ParseMode.MARKDOWN
         )
     except BadRequest:
         pass
@@ -609,7 +618,7 @@ async def on_quality(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif isinstance(payload, list):
         status = await context.bot.send_message(
             chat_id,
-            f"Downloading {len(payload)} tracks at {quality} kbps…"
+            f"⬇️  Downloading {len(payload)} tracks at {quality} kbps…"
         )
         for song in payload:
             try:
@@ -618,7 +627,7 @@ async def on_quality(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception as e:
                 await context.bot.send_message(
                     chat_id,
-                    f"Skipped *{song.get('title','?')}*\n`{e}`",
+                    f"⚠️  Skipped *{song.get('title','?')}*\n`{e}`",
                     parse_mode=ParseMode.MARKDOWN,
                 )
         await status.delete()
@@ -627,9 +636,10 @@ async def on_quality(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         song   = payload
         src    = song.get("source", SRC_YT)
+        title  = song.get("title","?")
         status = await context.bot.send_message(
             chat_id,
-            f"Downloading *{song.get('title','?')}* at {quality} kbps…",
+            f"⬇️  Downloading *{title}* at {quality} kbps…",
             parse_mode=ParseMode.MARKDOWN,
         )
         try:
@@ -640,7 +650,7 @@ async def on_quality(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await status.delete()
         except Exception as e:
             log.error(f"Search-pick download error: {e}")
-            await status.edit_text(f"Download failed.\n`{e}`", parse_mode=ParseMode.MARKDOWN)
+            await status.edit_text(f"❌  Download failed.\n`{e}`", parse_mode=ParseMode.MARKDOWN)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -648,29 +658,39 @@ async def on_quality(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ══════════════════════════════════════════════════════════════════════════════
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Hey there! 👋\n\n"
-        "I can download music from *JioSaavn*, *Spotify*, *YouTube*, "
-        "or just search by song name.\n\n"
-        "Send me a link or type a song name to get started.\n\n"
-        "Every file comes with cover art, lyrics and full metadata.\n\n"
-        "Use /help for more info.",
+        "🎶  *Welcome to Music Downloader Bot!*\n\n"
+        "Drop a link or type a song name — I'll handle the rest.\n\n"
+        "🎵  JioSaavn  ·  song, album, playlist\n"
+        "💚  Spotify  ·  track, album, playlist, artist\n"
+        "▶️  YouTube  ·  any video link\n"
+        "🔍  Search  ·  just type a song or artist name\n\n"
+        "Every file comes packed with cover art, lyrics, "
+        "artist, album and year tags. 🎧\n\n"
+        "Type /help to see all options.",
         parse_mode=ParseMode.MARKDOWN,
     )
 
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "*How to use:*\n\n"
-        "*Links* — paste any of these:\n"
-        "  JioSaavn song / album / playlist URL\n"
-        "  Spotify track / album / playlist / artist URL\n"
-        "  YouTube video URL\n\n"
-        "*Search* — just type a song name:\n"
-        "  You'll get a list with filters for JioSaavn and YouTube.\n"
-        "  For JioSaavn you can switch between Songs, Albums and Artists.\n"
-        "  Use Next/Prev to browse pages.\n\n"
-        "*Quality* — choose 128 or 320 kbps before every download.\n\n"
-        "Files include cover art, title, artist, album, year and lyrics.",
+        "🛠  *How it works*\n\n"
+        "━━━━━━━━━━━━━━━\n"
+        "🔗  *Send a link*\n"
+        "  🎵 JioSaavn — song, album or playlist URL\n"
+        "  💚 Spotify — track, album, playlist or artist URL\n"
+        "  ▶️ YouTube — any video URL\n\n"
+        "🔍  *Search by name*\n"
+        "  Type any song or artist name.\n"
+        "  Use the filter row to switch between\n"
+        "  JioSaavn and YouTube results.\n"
+        "  On JioSaavn, tap 🎶 Songs / 💿 Albums / 🎤 Artists\n"
+        "  to change the result type.\n"
+        "  Browse pages with ◀ and ▶.\n\n"
+        "🎚  *Quality*\n"
+        "  Choose 128 kbps or 320 kbps before every download.\n\n"
+        "📦  *Every file includes*\n"
+        "  Cover art · Title · Artist · Album · Year · Lyrics\n"
+        "━━━━━━━━━━━━━━━",
         parse_mode=ParseMode.MARKDOWN,
     )
 
@@ -690,26 +710,31 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     def _quality_kbd(key):
         return InlineKeyboardMarkup([[
-            InlineKeyboardButton("128 kbps", callback_data=f"q|128|{key}"),
-            InlineKeyboardButton("320 kbps", callback_data=f"q|320|{key}"),
+            InlineKeyboardButton("🎵  128 kbps", callback_data=f"q|128|{key}"),
+            InlineKeyboardButton("🎧  320 kbps", callback_data=f"q|320|{key}"),
         ]])
 
     if jio_kind:
         context.bot_data[mid] = {"type": "jio", "url": text, "kind": jio_kind}
+        kind_label = {"song": "Song", "album": "Album", "playlist": "Playlist"}.get(jio_kind, "Link")
         await update.message.reply_text(
-            f"JioSaavn link detected. Choose quality:",
+            f"🎵  *JioSaavn {kind_label}* detected\n\nPick your quality 👇",
+            parse_mode=ParseMode.MARKDOWN,
             reply_markup=_quality_kbd(mid),
         )
     elif sp_kind:
         context.bot_data[mid] = {"type": "spotify", "url": text, "kind": sp_kind}
+        kind_label = {"track": "Track", "album": "Album", "playlist": "Playlist", "artist": "Artist"}.get(sp_kind, "Link")
         await update.message.reply_text(
-            f"Spotify link detected. Choose quality:",
+            f"💚  *Spotify {kind_label}* detected\n\nPick your quality 👇",
+            parse_mode=ParseMode.MARKDOWN,
             reply_markup=_quality_kbd(mid),
         )
     elif yt:
         context.bot_data[mid] = {"type": "youtube", "url": text, "kind": ""}
         await update.message.reply_text(
-            f"YouTube link detected. Choose quality:",
+            f"▶️  *YouTube* link detected\n\nPick your quality 👇",
+            parse_mode=ParseMode.MARKDOWN,
             reply_markup=_quality_kbd(mid),
         )
     else:
