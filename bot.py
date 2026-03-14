@@ -34,11 +34,24 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(na
 log = logging.getLogger(__name__)
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
-PAGE_SIZE   = 6    # results per page
+PAGE_SIZE   = 6
 SRC_JIO     = "jiosaavn"
 SRC_YT      = "youtube"
 SRC_LABELS  = {SRC_JIO: "JioSaavn", SRC_YT: "YouTube"}
+SRC_ICONS   = {SRC_JIO: "🎵", SRC_YT: "▶️"}
 JIO_TYPES   = {"songs": "Songs", "albums": "Albums", "artists": "Artists"}
+JIO_ICONS   = {"songs": "🎶", "albums": "💿", "artists": "🎤"}
+
+# Suggested related search terms appended to query for more variety
+def _suggest_terms(query: str) -> list[str]:
+    """Return related search suggestion chips based on query."""
+    q = query.strip()
+    suggestions = []
+    # Add common related suffixes people search for
+    for suffix in ["songs", "hits", "album", "latest", "best of", "playlist"]:
+        if suffix.lower() not in q.lower():
+            suggestions.append(f"{q} {suffix}")
+    return suggestions[:4]
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -128,7 +141,7 @@ def _drop(context, sid):
     context.bot_data.pop(f"s:{sid}", None)
 
 
-async def _fetch_results(query: str, source: str, jio_type: str = "songs", limit: int = 25) -> list[dict]:
+async def _fetch_results(query: str, source: str, jio_type: str = "songs", limit: int = 50) -> list[dict]:
     """Fetch up to `limit` results for one source."""
     try:
         if source == SRC_JIO:
@@ -148,70 +161,97 @@ async def _fetch_results(query: str, source: str, jio_type: str = "songs", limit
 
 
 def _build_search_kbd(results: list[dict], sid: str, source: str, jio_type: str,
-                      page: int, total_pages: int) -> InlineKeyboardMarkup:
+                      page: int, total_pages: int, query: str = "") -> InlineKeyboardMarkup:
     """
-    Build keyboard:
-      Row(s): numbered result buttons
-      Row: source selector  [JioSaavn] or [YouTube]  (one active at a time)
-      Row (JioSaavn only):  [Songs] [Albums] [Artists]
-      Row: pagination       [◀ Prev]  Page N/M  [Next ▶]  (if >1 page)
-      Row: [Close]
+    Keyboard layout:
+      Numbered result buttons (6 per page)
+      Source row:   🎵 JioSaavn  /  ▶️ YouTube   (radio — one active)
+      Type row:     🎶 Songs  💿 Albums  🎤 Artists  (JioSaavn only)
+      Suggestion:   🔍 related query chips
+      Pagination:   ◀  Page N/M  ▶
+      Close:        ✕ Close
     """
     buttons = []
 
     # ── Result rows ───────────────────────────────────────────────────────────
-    start = page * PAGE_SIZE
+    start        = page * PAGE_SIZE
     page_results = results[start : start + PAGE_SIZE]
 
     for i, s in enumerate(page_results):
         global_i = start + i
-        dur   = f"  {human_dur(s['duration'])}" if s.get("duration") else ""
-        rtype = s.get("result_type", "")
-        artist = s.get("artist") or ""
-        title  = s.get("title") or "Unknown"
+        dur      = f"  {human_dur(s['duration'])}" if s.get("duration") else ""
+        rtype    = s.get("result_type", "")
+        artist   = s.get("artist") or ""
+        title    = s.get("title") or "Unknown"
 
         if rtype == "album":
-            label = f"{global_i+1}. {title} — {artist}{dur}"
+            icon  = "💿"
+            label = f"{icon}  {title}  —  {artist}"
         elif rtype == "artist":
-            label = f"{global_i+1}. {artist or title}"
+            icon  = "🎤"
+            label = f"{icon}  {artist or title}"
         else:
-            label = f"{global_i+1}. {artist} — {title}{dur}" if artist else f"{global_i+1}. {title}{dur}"
+            icon  = "🎵"
+            label = f"{icon}  {artist}  —  {title}{dur}" if artist else f"{icon}  {title}{dur}"
 
-        if len(label) > 60: label = label[:57] + "…"
+        label = f"{global_i+1}.  {label[3:]}"   # keep number, strip duplicate icon — add back below
+        label = f"{global_i+1}. {icon} {artist} — {title}{dur}" if (artist and not rtype) \
+                else f"{global_i+1}. {icon} {title} — {artist}{dur}" if rtype == "album" \
+                else f"{global_i+1}. {icon} {artist or title}"  if rtype == "artist" \
+                else f"{global_i+1}. {icon} {title}{dur}"
+        if len(label) > 62: label = label[:59] + "…"
         buttons.append([InlineKeyboardButton(label, callback_data=f"pick|{sid}|{global_i}")])
 
-    # ── Source selector row ───────────────────────────────────────────────────
+    # ── Source row (radio) ────────────────────────────────────────────────────
     src_row = []
-    for src, lbl in SRC_LABELS.items():
-        marker = "●" if src == source else "○"
+    for src in [SRC_JIO, SRC_YT]:
+        icon   = SRC_ICONS[src]
+        lbl    = SRC_LABELS[src]
+        active = "  ✦" if src == source else ""
         src_row.append(InlineKeyboardButton(
-            f"{marker} {lbl}",
-            callback_data=f"src|{sid}|{src}"
+            f"{icon} {lbl}{active}",
+            callback_data=f"src|{sid}|{src}",
         ))
     buttons.append(src_row)
 
-    # ── JioSaavn type sub-buttons ─────────────────────────────────────────────
+    # ── JioSaavn type row ─────────────────────────────────────────────────────
     if source == SRC_JIO:
         type_row = []
         for key, lbl in JIO_TYPES.items():
-            marker = "●" if key == jio_type else "○"
+            icon   = JIO_ICONS[key]
+            active = "  ✦" if key == jio_type else ""
             type_row.append(InlineKeyboardButton(
-                f"{marker} {lbl}",
-                callback_data=f"jtype|{sid}|{key}"
+                f"{icon} {lbl}{active}",
+                callback_data=f"jtype|{sid}|{key}",
             ))
         buttons.append(type_row)
 
-    # ── Pagination row ────────────────────────────────────────────────────────
+    # ── Related suggestions ───────────────────────────────────────────────────
+    if query and page == 0:
+        suggestions = _suggest_terms(query)
+        if suggestions:
+            # Split into rows of 2
+            for i in range(0, min(len(suggestions), 4), 2):
+                row = []
+                for sug in suggestions[i:i+2]:
+                    short = sug if len(sug) <= 22 else sug[:19] + "…"
+                    row.append(InlineKeyboardButton(
+                        f"🔍 {short}",
+                        callback_data=f"suggest|{sid}|{sug[:40]}",
+                    ))
+                buttons.append(row)
+
+    # ── Pagination ────────────────────────────────────────────────────────────
     if total_pages > 1:
         pg_row = []
         if page > 0:
-            pg_row.append(InlineKeyboardButton("◀ Prev", callback_data=f"pg|{sid}|{page-1}"))
-        pg_row.append(InlineKeyboardButton(f"Page {page+1}/{total_pages}", callback_data="noop"))
+            pg_row.append(InlineKeyboardButton("◀  Prev", callback_data=f"pg|{sid}|{page-1}"))
+        pg_row.append(InlineKeyboardButton(f"  {page+1} / {total_pages}  ", callback_data="noop"))
         if page < total_pages - 1:
-            pg_row.append(InlineKeyboardButton("Next ▶", callback_data=f"pg|{sid}|{page+1}"))
+            pg_row.append(InlineKeyboardButton("Next  ▶", callback_data=f"pg|{sid}|{page+1}"))
         buttons.append(pg_row)
 
-    buttons.append([InlineKeyboardButton("✕ Close", callback_data=f"pick|{sid}|close")])
+    buttons.append([InlineKeyboardButton("✕  Close", callback_data=f"pick|{sid}|close")])
     return InlineKeyboardMarkup(buttons)
 
 
@@ -243,18 +283,18 @@ async def _render_search(context, chat_id, sid: str, msg_id: int | None = None) 
 
     if results:
         text = (
-            f"*Search:* `{query}`\n"
-            f"_{subtitle}_  —  {len(results)} results\n\n"
-            f"Tap a result to download:"
+            f"🔍  *{query}*\n"
+            f"_{subtitle}_  ·  {len(results)} results\n\n"
+            f"Tap any result to download ↓"
         )
     else:
         text = (
-            f"*Search:* `{query}`\n"
+            f"🔍  *{query}*\n"
             f"_{subtitle}_\n\n"
-            f"No results found. Try a different source or type."
+            f"No results found. Try switching source or type."
         )
 
-    kbd = _build_search_kbd(results, sid, source, jio_type, page, total_pages)
+    kbd = _build_search_kbd(results, sid, source, jio_type, page, total_pages, query=query)
 
     if msg_id:
         try:
@@ -271,7 +311,7 @@ async def _render_search(context, chat_id, sid: str, msg_id: int | None = None) 
 
 
 async def run_search(context, chat_id: int, query: str, sid: str):
-    status = await context.bot.send_message(chat_id, f"Searching _{query}_…", parse_mode=ParseMode.MARKDOWN)
+    status = await context.bot.send_message(chat_id, f"🔍  Searching _{query}_…", parse_mode=ParseMode.MARKDOWN)
     _save(context, sid, {
         "query":    query,
         "source":   SRC_JIO,
@@ -286,6 +326,24 @@ async def run_search(context, chat_id: int, query: str, sid: str):
 # ══════════════════════════════════════════════════════════════════════════════
 #  CALLBACK HANDLERS
 # ══════════════════════════════════════════════════════════════════════════════
+async def on_suggestion(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """User taps a related suggestion chip — re-search with that query."""
+    cb = update.callback_query
+    await cb.answer()
+    _, sid, new_query = cb.data.split("|", 2)
+
+    sess = _sess(context, sid)
+    if not sess:
+        await cb.edit_message_text("Session expired. Search again.")
+        return
+
+    sess["query"]    = new_query
+    sess["page"]     = 0
+    sess["cache"]    = {}   # clear cache for new query
+    _save(context, sid, sess)
+    await _render_search(context, update.effective_chat.id, sid, msg_id=cb.message.message_id)
+
+
 async def on_noop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.callback_query.answer()
 
@@ -683,6 +741,7 @@ async def main():
     app.add_handler(CommandHandler("help",  cmd_help))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
     app.add_handler(CallbackQueryHandler(on_noop,         pattern=r"^noop$"))
+    app.add_handler(CallbackQueryHandler(on_suggestion,   pattern=r"^suggest\|"))
     app.add_handler(CallbackQueryHandler(on_source_switch, pattern=r"^src\|"))
     app.add_handler(CallbackQueryHandler(on_jio_type,      pattern=r"^jtype\|"))
     app.add_handler(CallbackQueryHandler(on_page,          pattern=r"^pg\|"))
