@@ -234,6 +234,18 @@ def _build_search_kbd(results: list[dict], sid: str, source: str, jio_type: str,
         if len(label) > 62: label = label[:59] + "…"
         buttons.append([InlineKeyboardButton(label, callback_data=f"pick|{sid}|{global_i}")])
 
+    # ── JioSaavn type row (ABOVE source row) ─────────────────────────────────
+    if source == SRC_JIO:
+        type_row = []
+        for key, lbl in JIO_TYPES.items():
+            icon   = JIO_ICONS[key]
+            active = "  ✦" if key == jio_type else ""
+            type_row.append(InlineKeyboardButton(
+                f"{icon} {lbl}{active}",
+                callback_data=f"jtype|{sid}|{key}",
+            ))
+        buttons.append(type_row)
+
     # ── Source row (radio) ────────────────────────────────────────────────────
     src_row = []
     for src in [SRC_JIO, SRC_YT]:
@@ -245,18 +257,6 @@ def _build_search_kbd(results: list[dict], sid: str, source: str, jio_type: str,
             callback_data=f"src|{sid}|{src}",
         ))
     buttons.append(src_row)
-
-    # ── JioSaavn type row ─────────────────────────────────────────────────────
-    if source == SRC_JIO:
-        type_row = []
-        for key, lbl in JIO_TYPES.items():
-            icon   = JIO_ICONS[key]
-            active = "  ✦" if key == jio_type else ""
-            type_row.append(InlineKeyboardButton(
-                f"{icon} {lbl}{active}",
-                callback_data=f"jtype|{sid}|{key}",
-            ))
-        buttons.append(type_row)
 
     # ── Related suggestions ───────────────────────────────────────────────────
     if query and page == 0:
@@ -459,39 +459,51 @@ async def on_search_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except (IndexError, ValueError):
         return
 
-    # If album/artist was picked → fetch songs, go back to search view
+    # If album picked → load its songs then show quality picker
     rtype = item.get("result_type", "")
     if rtype == "album":
-        await cb.answer("Loading album…", show_alert=False)
-        album_q = item.get("album_query") or item.get("title", "")
-        status  = await context.bot.send_message(
+        album_url = item.get("album_url") or ""
+        album_q   = item.get("album_query") or item.get("title", "")
+        status    = await context.bot.send_message(
             update.effective_chat.id,
-            f"Loading album _{item.get('title')}_…",
+            f"Loading _{item.get('title')}_…",
             parse_mode=ParseMode.MARKDOWN,
         )
-        songs = await search_songs(album_q, limit=25)
+        # Try URL fetch first, fall back to name search
+        if album_url:
+            songs = await fetch_album(album_url)
+        else:
+            songs = await search_songs(album_q, limit=30)
+            # Filter to only songs that match the album name
+            album_name = item.get("title", "").lower()
+            matching   = [s for s in songs if album_name in s.get("album","").lower()]
+            if matching:
+                songs = matching
+
         await status.delete()
         if not songs:
-            await context.bot.send_message(update.effective_chat.id, "No songs found for this album.")
+            await context.bot.send_message(update.effective_chat.id,
+                                           "No songs found for this album.")
             return
-        # Show quality picker for whole album
+
         pick_key = f"p:{sid}:album"
-        context.bot_data[pick_key] = songs   # list of songs
+        context.bot_data[pick_key] = songs
         _drop(context, sid)
         kbd = InlineKeyboardMarkup([[
             InlineKeyboardButton("128 kbps", callback_data=f"q|128|{pick_key}"),
             InlineKeyboardButton("320 kbps", callback_data=f"q|320|{pick_key}"),
         ]])
         await cb.edit_message_text(
-            f"*{item.get('title')}*\n_{item.get('artist','')}_\n\n{len(songs)} songs — choose quality:",
+            f"*{item.get('title')}*\n_{item.get('artist','')}_\n\n"
+            f"{len(songs)} songs — choose quality:",
             parse_mode=ParseMode.MARKDOWN, reply_markup=kbd,
         )
         return
 
+    # If artist picked → new search with that artist name as query
     if rtype == "artist":
         artist_name = item.get("artist") or item.get("title", "")
-        # Search songs by this artist
-        new_sid = f"{sid}_ar"
+        new_sid     = f"{sid}_ar"
         _drop(context, sid)
         _save(context, new_sid, {
             "query":    artist_name,
