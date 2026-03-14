@@ -335,41 +335,65 @@ def _safe_fn(s: str) -> str:
 
 async def download_spotify_track(song: dict, quality: str = "320") -> str:
     """
-    Find best match for a Spotify track and download audio.
+    Download audio for a Spotify track.
 
-    Strategy (in order):
-      1. ytsearch1: + android player client (bypasses sign-in check)
-      2. ytsearch1:  — regular YouTube search fallback
-      3. ASCII query — for Tamil/regional scripts that confuse search
+    Strategy:
+      1. JioSaavn search  ← best for Indian/Tamil/Malayalam songs, NO YouTube bot issues
+      2. yt-dlp ios client ← YouTube fallback for non-Indian tracks
 
-    android player_client is the key fix:
-      Regular YouTube (ytsearch1:) triggers "Sign in to confirm not a bot"
-      on cloud server IPs like Koyeb/Railway.
-      YouTube Music search is more permissive and returns better audio matches.
+    JioSaavn is preferred because:
+      - Koyeb/Railway/Fly IPs are blocked by YouTube bot detection
+      - JioSaavn has the largest Indian music catalogue
+      - JioSaavn downloads are direct HTTP — no bot issues ever
     """
+    from helpers.jiosaavn import search_songs, download_and_encode
+
     title  = song.get("title", "") or ""
     artist = song.get("artist", "") or ""
     query  = f"{title} {artist}".strip()
 
-    # ASCII fallback for Tamil/regional scripts
-    ascii_q = unicodedata.normalize("NFKD", query).encode("ascii", "ignore").decode().strip()
-
-    # Search targets in priority order — all using ytsearch1: with android client
-    targets = [f"ytsearch1:{query}"]
-    if ascii_q and ascii_q != query:
-        targets.append(f"ytsearch1:{ascii_q}")          # ASCII fallback for Tamil/regional
-    targets.append(f"ytsearch1:{title}")                # title only if artist name confuses search
-
     os.makedirs(DOWNLOAD_DIR, exist_ok=True)
     base       = _safe_fn(f"{artist} - {title}" if artist else title)
-    out_tmpl   = os.path.join(DOWNLOAD_DIR, f"{base}_{quality}kbps.%(ext)s")
     final_path = os.path.join(DOWNLOAD_DIR, f"{base}_{quality}kbps.mp3")
 
     if os.path.exists(final_path):
         return final_path
 
-    # android player client never requires sign-in — works on all cloud IPs
-    BASE_OPTS = {
+    # ── Strategy 1: JioSaavn search (no YouTube, no bot issues) ──────────────
+    log.info(f"Spotify→JioSaavn search: {query}")
+    try:
+        jio_results = await search_songs(query, quality=quality, limit=1)
+        if not jio_results:
+            # Try title only (in case artist name is in English but song is regional)
+            jio_results = await search_songs(title, quality=quality, limit=1)
+
+        if jio_results:
+            jio_song = jio_results[0]
+            jio_song["quality"] = quality
+            path = await download_and_encode(jio_song)
+            # Override metadata with Spotify info (better cover art, album etc)
+            song["lyrics"] = jio_song.get("lyrics") or song.get("lyrics") or ""
+            log.info(f"✅ Spotify track via JioSaavn: {title}")
+            # Rename to expected final_path
+            if path != final_path:
+                import shutil
+                shutil.move(path, final_path)
+            return final_path
+    except Exception as e:
+        log.warning(f"JioSaavn fallback failed for '{title}': {e}")
+
+    # ── Strategy 2: yt-dlp with ios player client ─────────────────────────────
+    # ios client is the most reliable for bypassing YouTube bot checks on cloud IPs
+    log.info(f"Spotify→YouTube (ios client): {query}")
+
+    ascii_q = unicodedata.normalize("NFKD", query).encode("ascii", "ignore").decode().strip()
+    yt_targets = [f"ytsearch1:{query}"]
+    if ascii_q and ascii_q != query:
+        yt_targets.append(f"ytsearch1:{ascii_q}")
+    yt_targets.append(f"ytsearch1:{title}")
+
+    out_tmpl = os.path.join(DOWNLOAD_DIR, f"{base}_{quality}kbps.%(ext)s")
+    yt_opts  = {
         "format":        "bestaudio/best",
         "outtmpl":       out_tmpl,
         "quiet":         True,
@@ -384,38 +408,31 @@ async def download_spotify_track(song: dict, quality: str = "320") -> str:
         "retries":       3,
         "socket_timeout": 30,
         "extractor_args": {
-            "youtube": {
-                "player_client": ["android", "web"],   # android skips sign-in check
-            },
+            "youtube": {"player_client": ["ios"]},   # ios bypasses bot check on cloud IPs
         },
     }
 
     loop = asyncio.get_event_loop()
     last_err = ""
-    for target in targets:
-        # Clean partial files before each attempt
+    for target in yt_targets:
         for f in Path(DOWNLOAD_DIR).glob(f"{base}_{quality}kbps.*"):
             try: f.unlink()
             except OSError: pass
-
         try:
-            log.info(f"Trying: {target}")
             def _run(t=target):
-                with yt_dlp.YoutubeDL(BASE_OPTS) as ydl:
+                with yt_dlp.YoutubeDL(yt_opts) as ydl:
                     ydl.download([t])
             await loop.run_in_executor(None, _run)
-
             if os.path.exists(final_path):
-                log.info(f"✅ Downloaded: {title}")
+                log.info(f"✅ Spotify track via YouTube: {title}")
                 return final_path
-
         except Exception as e:
             last_err = str(e)
-            log.warning(f"Failed ({target}): {e}")
+            log.warning(f"YouTube failed ({target}): {e}")
 
     raise RuntimeError(
-        f"All download attempts failed for: {title}\n"
-        f"Last error: {last_err}"
+        f"Could not download: {title}\n"
+        f"Tried JioSaavn + YouTube. Last error: {last_err}"
     )
 
 
@@ -429,14 +446,8 @@ async def search_youtube(query: str, limit: int = MAX_SEARCH_RESULTS) -> list[di
         "noplaylist":    False,
         "ignoreerrors":  True,
         "extractor_args": {
-            "youtube": {"player_client": ["android", "web"]},
+            "youtube": {"player_client": ["ios"]},
         },
-    }
-    loop = asyncio.get_event_loop()
-    try:
-        def _run():
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                return ydl.extract_info(f"ytsearch{limit}:{query}", download=False)
         info = await loop.run_in_executor(None, _run)
         if not info:
             return []
@@ -497,7 +508,7 @@ async def download_yt(
         "retries":        3,
         "socket_timeout": 30,
         "extractor_args": {
-            "youtube": {"player_client": ["android", "web"]},
+            "youtube": {"player_client": ["ios"]},
         },
     }
     loop = asyncio.get_event_loop()
