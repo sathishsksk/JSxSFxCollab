@@ -338,11 +338,11 @@ async def download_spotify_track(song: dict, quality: str = "320") -> str:
     Find best match for a Spotify track and download audio.
 
     Strategy (in order):
-      1. ytmsearch1: — YouTube Music search (least bot-detection on cloud IPs)
+      1. ytsearch1: + android player client (bypasses sign-in check)
       2. ytsearch1:  — regular YouTube search fallback
       3. ASCII query — for Tamil/regional scripts that confuse search
 
-    YouTube Music (ytmsearch1:) is the key fix:
+    android player_client is the key fix:
       Regular YouTube (ytsearch1:) triggers "Sign in to confirm not a bot"
       on cloud server IPs like Koyeb/Railway.
       YouTube Music search is more permissive and returns better audio matches.
@@ -354,13 +354,11 @@ async def download_spotify_track(song: dict, quality: str = "320") -> str:
     # ASCII fallback for Tamil/regional scripts
     ascii_q = unicodedata.normalize("NFKD", query).encode("ascii", "ignore").decode().strip()
 
-    # Search targets in priority order
-    targets = [f"ytmsearch1:{query}"]                      # YouTube Music ← best for cloud
+    # Search targets in priority order — all using ytsearch1: with android client
+    targets = [f"ytsearch1:{query}"]
     if ascii_q and ascii_q != query:
-        targets.append(f"ytmsearch1:{ascii_q}")             # ASCII version on YT Music
-    targets.append(f"ytsearch1:{query}")                    # regular YouTube fallback
-    if ascii_q and ascii_q != query:
-        targets.append(f"ytsearch1:{ascii_q}")
+        targets.append(f"ytsearch1:{ascii_q}")          # ASCII fallback for Tamil/regional
+    targets.append(f"ytsearch1:{title}")                # title only if artist name confuses search
 
     os.makedirs(DOWNLOAD_DIR, exist_ok=True)
     base       = _safe_fn(f"{artist} - {title}" if artist else title)
@@ -370,60 +368,50 @@ async def download_spotify_track(song: dict, quality: str = "320") -> str:
     if os.path.exists(final_path):
         return final_path
 
-    def _make_opts(target: str) -> dict:
-        opts = {
-            "format":        "bestaudio/best",
-            "outtmpl":       out_tmpl,
-            "quiet":         True,
-            "no_warnings":   True,
-            "noplaylist":    True,
-            "postprocessors": [{
-                "key":              "FFmpegExtractAudio",
-                "preferredcodec":   "mp3",
-                "preferredquality": quality,
-            }],
-            "http_headers":  HEADERS,
-            "retries":       3,
-            "socket_timeout": 30,
-            # bypass age/sign-in checks
-            "extractor_args": {
-                "youtube": {
-                    "skip": ["dash", "hls"],
-                    "player_skip": ["js", "configs", "webpage"],
-                },
+    # android player client never requires sign-in — works on all cloud IPs
+    BASE_OPTS = {
+        "format":        "bestaudio/best",
+        "outtmpl":       out_tmpl,
+        "quiet":         True,
+        "no_warnings":   True,
+        "noplaylist":    True,
+        "postprocessors": [{
+            "key":              "FFmpegExtractAudio",
+            "preferredcodec":   "mp3",
+            "preferredquality": quality,
+        }],
+        "http_headers":  HEADERS,
+        "retries":       3,
+        "socket_timeout": 30,
+        "extractor_args": {
+            "youtube": {
+                "player_client": ["android", "web"],   # android skips sign-in check
             },
-        }
-        # YouTube Music needs its own extractor arg
-        if target.startswith("ytmsearch"):
-            opts["extractor_args"]["youtubemusic"] = {"skip": ["dash"]}
-        return opts
+        },
+    }
 
     loop = asyncio.get_event_loop()
     last_err = ""
     for target in targets:
-        # Clean up partial file before each attempt
+        # Clean partial files before each attempt
         for f in Path(DOWNLOAD_DIR).glob(f"{base}_{quality}kbps.*"):
             try: f.unlink()
             except OSError: pass
 
         try:
             log.info(f"Trying: {target}")
-            opts = _make_opts(target)
-            def _run(t=target, o=opts):
-                with yt_dlp.YoutubeDL(o) as ydl:
+            def _run(t=target):
+                with yt_dlp.YoutubeDL(BASE_OPTS) as ydl:
                     ydl.download([t])
             await loop.run_in_executor(None, _run)
 
             if os.path.exists(final_path):
-                log.info(f"✅ Downloaded via {target}")
+                log.info(f"✅ Downloaded: {title}")
                 return final_path
 
         except Exception as e:
             last_err = str(e)
             log.warning(f"Failed ({target}): {e}")
-            # Don't retry on non-bot errors (codec, network etc)
-            if "Sign in" not in last_err and "bot" not in last_err.lower():
-                break
 
     raise RuntimeError(
         f"All download attempts failed for: {title}\n"
@@ -433,7 +421,6 @@ async def download_spotify_track(song: dict, quality: str = "320") -> str:
 
 # ── YouTube search (for search results UI) ────────────────────────────────────
 async def search_youtube(query: str, limit: int = MAX_SEARCH_RESULTS) -> list[dict]:
-    # Use ytmsearch (YouTube Music) — less bot-detection on cloud IPs
     opts = {
         "quiet":         True,
         "no_warnings":   True,
@@ -442,44 +429,36 @@ async def search_youtube(query: str, limit: int = MAX_SEARCH_RESULTS) -> list[di
         "noplaylist":    False,
         "ignoreerrors":  True,
         "extractor_args": {
-            "youtube": {"skip": ["dash", "hls"]},
+            "youtube": {"player_client": ["android", "web"]},
         },
     }
     loop = asyncio.get_event_loop()
-
-    async def _try(prefix: str) -> list[dict]:
-        try:
-            def _run():
-                with yt_dlp.YoutubeDL(opts) as ydl:
-                    return ydl.extract_info(f"{prefix}{limit}:{query}", download=False)
-            info = await loop.run_in_executor(None, _run)
-            if not info:
-                return []
-            results = []
-            for e in (info.get("entries") or []):
-                if not e:
-                    continue
-                vid_id = e.get("id") or ""
-                results.append({
-                    "title":    e.get("title") or "Unknown",
-                    "artist":   e.get("uploader") or e.get("channel") or "",
-                    "album":    "",
-                    "image":    e.get("thumbnail") or "",
-                    "duration": int(e.get("duration") or 0),
-                    "search":   f"https://youtu.be/{vid_id}" if vid_id else e.get("url", ""),
-                    "lyrics":   "",
-                    "source":   "youtube",
-                })
-            return results[:limit]
-        except Exception as e:
-            log.warning(f"Search failed ({prefix}): {e}")
+    try:
+        def _run():
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                return ydl.extract_info(f"ytsearch{limit}:{query}", download=False)
+        info = await loop.run_in_executor(None, _run)
+        if not info:
             return []
-
-    # Try YouTube Music first, fall back to regular YouTube
-    results = await _try("ytmsearch")
-    if not results:
-        results = await _try("ytsearch")
-    return results
+        results = []
+        for e in (info.get("entries") or []):
+            if not e:
+                continue
+            vid_id = e.get("id") or ""
+            results.append({
+                "title":    e.get("title") or "Unknown",
+                "artist":   e.get("uploader") or e.get("channel") or "",
+                "album":    "",
+                "image":    e.get("thumbnail") or "",
+                "duration": int(e.get("duration") or 0),
+                "search":   f"https://youtu.be/{vid_id}" if vid_id else e.get("url", ""),
+                "lyrics":   "",
+                "source":   "youtube",
+            })
+        return results[:limit]
+    except Exception as e:
+        log.error(f"YouTube search error: {e}")
+        return []
 
 
 # ── yt-dlp download (direct YouTube URL or search) ────────────────────────────
@@ -518,34 +497,20 @@ async def download_yt(
         "retries":        3,
         "socket_timeout": 30,
         "extractor_args": {
-            "youtube": {"skip": ["dash", "hls"]},
+            "youtube": {"player_client": ["android", "web"]},
         },
     }
     loop = asyncio.get_event_loop()
+    try:
+        def _run():
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                ydl.download([target])
+        await loop.run_in_executor(None, _run)
+    except Exception as e:
+        log.error(f"yt-dlp error '{target}': {e}")
+        return None
 
-    # For plain search queries try YouTube Music first
-    if not (target.startswith("http") or target.startswith("www.")):
-        targets_to_try = [
-            f"ytmsearch1:{target.lstrip('ytsearch1:')}",
-            target,
-        ]
-    else:
-        targets_to_try = [target]
-
-    for t in targets_to_try:
-        try:
-            def _run(tgt=t):
-                with yt_dlp.YoutubeDL(opts) as ydl:
-                    ydl.download([tgt])
-            await loop.run_in_executor(None, _run)
-            if os.path.exists(final_path):
-                return final_path
-        except Exception as e:
-            log.warning(f"download_yt failed ({t}): {e}")
-            if "Sign in" not in str(e) and "bot" not in str(e).lower():
-                break
-
-    return None
+    return final_path if os.path.exists(final_path) else None
 
 
 # ── Genius lyrics ─────────────────────────────────────────────────────────────
