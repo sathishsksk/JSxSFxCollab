@@ -1,25 +1,39 @@
 """
 helpers/spotify_handler.py
 
-Spotify/YouTube via yt-dlp ONLY — no spotipy, no API keys, no 403 errors.
+Spotify downloads via spotDL (spotDL/spotify-downloader).
 
-yt-dlp has a built-in Spotify extractor that reads track metadata from
-Spotify's public pages and finds YouTube matches automatically.
+Why spotDL works (unlike spotipy):
+  - spotipy's search() calls /v1/search  → requires Premium since Nov 2024 → 403
+  - spotDL calls /v1/tracks /v1/albums /v1/playlists → still FREE with any dev account
+  - spotDL finds matching YouTube audio automatically
+  - spotDL embeds title, artist, album, cover art, lyrics in one go
 
-Supports:
-  - Spotify track / album / playlist / artist URLs
-  - YouTube direct URLs
-  - Song name search (ytsearch)
-  - Lyrics via Genius (optional)
+Flow:
+  Spotify URL
+    → spotDL.search([url])       # gets metadata from Spotify free endpoints
+    → spotDL.download(song)      # finds YouTube match, downloads, embeds tags
+    → returns MP3 path
+
+SPOTIFY_CLIENT_ID + SPOTIFY_CLIENT_SECRET still required (free developer account is fine).
+Get them at: developer.spotify.com/dashboard → Create App
+
+YouTube/Search downloads:
+  Direct YouTube URLs and search queries still use yt-dlp.
 """
 
 import os
 import re
 import asyncio
 import logging
+from pathlib import Path
+
 import yt_dlp
 
-from config import GENIUS_ACCESS_TOKEN, DOWNLOAD_DIR, MAX_PLAYLIST_SONGS, MAX_SEARCH_RESULTS
+from config import (
+    SPOTIFY_CLIENT_ID, SPOTIFY_CLIENT_SECRET,
+    GENIUS_ACCESS_TOKEN, DOWNLOAD_DIR, MAX_PLAYLIST_SONGS, MAX_SEARCH_RESULTS,
+)
 
 log = logging.getLogger(__name__)
 
@@ -44,93 +58,121 @@ def is_youtube(text: str) -> bool:
     return bool(_YT.search(text))
 
 
-# ── yt-dlp metadata extract (no download) ────────────────────────────────────
-def _extract(url: str, flat: bool = False) -> dict | None:
-    opts = {
-        "quiet":         True,
-        "no_warnings":   True,
-        "extract_flat":  flat,
-        "skip_download": True,
-        "noplaylist":    False,
-        "ignoreerrors":  True,
-        "socket_timeout": 25,
-    }
+# ── spotDL singleton ──────────────────────────────────────────────────────────
+_spotdl = None
+_spotdl_err: str | None = None
+
+
+def _get_spotdl(bitrate: str = "320k"):
+    """Lazy-init spotDL instance."""
+    global _spotdl, _spotdl_err
+
+    if not SPOTIFY_CLIENT_ID or not SPOTIFY_CLIENT_SECRET:
+        _spotdl_err = (
+            "SPOTIFY_CLIENT_ID or SPOTIFY_CLIENT_SECRET not set.\n"
+            "Add them in Koyeb env vars.\n"
+            "Get from: developer.spotify.com/dashboard (free account works)"
+        )
+        return None, _spotdl_err
+
     try:
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            return ydl.extract_info(url, download=False)
+        from spotdl import Spotdl
+        os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+
+        instance = Spotdl(
+            client_id=SPOTIFY_CLIENT_ID,
+            client_secret=SPOTIFY_CLIENT_SECRET,
+            downloader_settings={
+                "output":          f"{DOWNLOAD_DIR}/{{artist}} - {{title}}.{{output-ext}}",
+                "format":          "mp3",
+                "bitrate":         bitrate,
+                "threads":         1,
+                "overwrite":       "skip",
+                "log_level":       "ERROR",
+                "print_errors":    False,
+                "generate_lrc":    False,
+                "save_file":       None,
+                "lyrics_providers": ["musixmatch", "genius"],
+            },
+        )
+        _spotdl_err = None
+        return instance, None
     except Exception as e:
-        log.error(f"yt-dlp extract error for {url}: {e}")
-        return None
+        _spotdl_err = str(e)
+        log.error(f"spotDL init error: {e}")
+        return None, str(e)
 
 
-def _to_track(e: dict) -> dict | None:
-    if not e or not isinstance(e, dict):
-        return None
-    title  = e.get("track") or e.get("title") or "Unknown"
-    artist = e.get("artist") or e.get("uploader") or e.get("creator") or ""
-    album  = e.get("album") or ""
-    dur    = int(e.get("duration") or 0)
-    thumb  = e.get("thumbnail") or ""
-    if not thumb and e.get("thumbnails"):
-        thumb = e["thumbnails"][-1].get("url", "")
-    search = f"{title} {artist}".strip() if artist else title
+def _song_to_meta(song) -> dict:
+    """Convert spotDL Song object to our standard meta dict."""
+    artists = ", ".join(song.artists) if hasattr(song, "artists") else getattr(song, "artist", "")
     return {
-        "title":    title,
-        "artist":   artist,
-        "album":    album,
-        "image":    thumb,
-        "duration": dur,
-        "search":   search,
-        "lyrics":   "",
+        "title":    song.name,
+        "artist":   artists,
+        "album":    getattr(song, "album_name", "") or "",
+        "image":    getattr(song, "cover_url", "") or "",
+        "duration": int(getattr(song, "duration", 0) or 0),
+        "lyrics":   getattr(song, "lyrics", "") or "",
         "source":   "spotify",
     }
 
 
-# ── Spotify fetchers ──────────────────────────────────────────────────────────
-def spotify_track(url: str) -> tuple[list[dict], str | None]:
-    info = _extract(url, flat=False)
-    if not info:
-        return [], "yt-dlp could not read Spotify track"
-    t = _to_track(info)
-    return ([t], None) if t else ([], "Could not parse track info")
+# ── Spotify URL downloads ─────────────────────────────────────────────────────
+async def spotdl_download(url: str, bitrate: str = "320k") -> tuple[list[tuple[dict, str]], str | None]:
+    """
+    Download one or more tracks from a Spotify URL using spotDL.
+    Returns: ([(meta, filepath), ...], error_message)
+    """
+    spotdl, err = _get_spotdl(bitrate)
+    if err:
+        return [], err
+
+    loop = asyncio.get_event_loop()
+    try:
+        # 1. Get songs metadata from Spotify (uses /v1/tracks, /v1/albums etc — no Premium needed)
+        songs = await loop.run_in_executor(
+            None, lambda: spotdl.search([url])
+        )
+        if not songs:
+            return [], "Spotify URL returned no tracks. Check the link."
+
+        songs = songs[:MAX_PLAYLIST_SONGS]
+        log.info(f"spotDL found {len(songs)} track(s) for {url}")
+
+        results = []
+        for song in songs:
+            try:
+                # 2. Download: spotDL finds YouTube match, downloads, embeds tags
+                _, path = await loop.run_in_executor(
+                    None, lambda s=song: spotdl.download(s)
+                )
+                if path and Path(path).exists():
+                    meta = _song_to_meta(song)
+                    results.append((meta, str(path)))
+                else:
+                    log.warning(f"spotDL: no file for {song.name}")
+            except Exception as e:
+                log.error(f"spotDL download error for '{song.name}': {e}")
+
+        if not results:
+            return [], "spotDL could not download any tracks (YouTube match may not exist)"
+
+        return results, None
+
+    except Exception as e:
+        log.error(f"spotDL error: {e}")
+        err_str = str(e)
+        if "403" in err_str or "premium" in err_str.lower():
+            return [], (
+                "Spotify API 403.\n"
+                "Your app may be in dev mode. Fix:\n"
+                "developer.spotify.com → your app → Users and Access → add your email"
+            )
+        return [], f"spotDL error: {err_str}"
 
 
-def spotify_album(url: str) -> tuple[list[dict], str | None]:
-    info = _extract(url, flat=True)
-    if not info:
-        return [], "yt-dlp could not read Spotify album"
-    entries = info.get("entries") or []
-    tracks  = [t for e in entries[:MAX_PLAYLIST_SONGS]
-               for t in [_to_track(e)] if t]
-    return (tracks, None) if tracks else ([], "No tracks found in album")
-
-
-def spotify_playlist(url: str) -> tuple[list[dict], str | None]:
-    info = _extract(url, flat=True)
-    if not info:
-        return [], "yt-dlp could not read Spotify playlist"
-    entries = info.get("entries") or []
-    tracks  = [t for e in entries[:MAX_PLAYLIST_SONGS]
-               for t in [_to_track(e)] if t]
-    return (tracks, None) if tracks else ([], "No tracks found in playlist")
-
-
-def spotify_artist(url: str) -> tuple[list[dict], str | None]:
-    info = _extract(url, flat=True)
-    if not info:
-        return [], "yt-dlp could not read Spotify artist"
-    entries = info.get("entries") or []
-    tracks  = [t for e in entries[:10]
-               for t in [_to_track(e)] if t]
-    return (tracks, None) if tracks else ([], "No tracks found for artist")
-
-
-# ── YouTube search — returns multiple results ─────────────────────────────────
+# ── YouTube search — multiple results ─────────────────────────────────────────
 async def search_youtube(query: str, limit: int = MAX_SEARCH_RESULTS) -> list[dict]:
-    """
-    Search YouTube and return up to `limit` results.
-    Used for the search-results picker UI.
-    """
     opts = {
         "quiet":         True,
         "no_warnings":   True,
@@ -147,22 +189,18 @@ async def search_youtube(query: str, limit: int = MAX_SEARCH_RESULTS) -> list[di
         info = await loop.run_in_executor(None, _run)
         if not info:
             return []
-        entries = info.get("entries") or []
         results = []
-        for e in entries:
+        for e in (info.get("entries") or []):
             if not e:
                 continue
-            title  = e.get("title") or "Unknown"
-            artist = e.get("uploader") or e.get("channel") or ""
-            dur    = int(e.get("duration") or 0)
-            yt_url = e.get("url") or e.get("webpage_url") or f"https://youtu.be/{e.get('id','')}"
+            vid_id = e.get("id") or ""
             results.append({
-                "title":    title,
-                "artist":   artist,
+                "title":    e.get("title") or "Unknown",
+                "artist":   e.get("uploader") or e.get("channel") or "",
                 "album":    "",
                 "image":    e.get("thumbnail") or "",
-                "duration": dur,
-                "search":   yt_url,   # use direct URL for download
+                "duration": int(e.get("duration") or 0),
+                "search":   f"https://youtu.be/{vid_id}" if vid_id else e.get("url", ""),
                 "lyrics":   "",
                 "source":   "youtube",
             })
@@ -175,29 +213,6 @@ async def search_youtube(query: str, limit: int = MAX_SEARCH_RESULTS) -> list[di
 # ── yt-dlp audio download ─────────────────────────────────────────────────────
 def _safe_fn(s: str) -> str:
     return re.sub(r'[<>:"/\\|?*\n\r\t]', "", s).strip()[:80]
-
-
-def _ydl_opts(out_tmpl: str, quality: str) -> dict:
-    return {
-        "format":       "bestaudio/best",
-        "outtmpl":      out_tmpl,
-        "quiet":        True,
-        "no_warnings":  True,
-        "noplaylist":   True,
-        "postprocessors": [{
-            "key":              "FFmpegExtractAudio",
-            "preferredcodec":   "mp3",
-            "preferredquality": quality,
-        }],
-        "http_headers": {
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 Chrome/124 Safari/537.36"
-            )
-        },
-        "retries":        3,
-        "socket_timeout": 30,
-    }
 
 
 async def download_yt(
@@ -222,14 +237,34 @@ async def download_yt(
     if not (target.startswith("http") or target.startswith("www.")):
         target = f"ytsearch1:{target}"
 
+    opts = {
+        "format":       "bestaudio/best",
+        "outtmpl":      out_tmpl,
+        "quiet":        True,
+        "no_warnings":  True,
+        "noplaylist":   True,
+        "postprocessors": [{
+            "key":              "FFmpegExtractAudio",
+            "preferredcodec":   "mp3",
+            "preferredquality": quality,
+        }],
+        "http_headers": {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 Chrome/124 Safari/537.36"
+            )
+        },
+        "retries":        3,
+        "socket_timeout": 30,
+    }
     loop = asyncio.get_event_loop()
     try:
         def _run():
-            with yt_dlp.YoutubeDL(_ydl_opts(out_tmpl, quality)) as ydl:
+            with yt_dlp.YoutubeDL(opts) as ydl:
                 ydl.download([target])
         await loop.run_in_executor(None, _run)
     except Exception as e:
-        log.error(f"yt-dlp download error for '{target}': {e}")
+        log.error(f"yt-dlp error '{target}': {e}")
         return None
 
     return final_path if os.path.exists(final_path) else None
