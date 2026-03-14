@@ -321,21 +321,21 @@ async def run_jiosaavn(context, chat_id, url, kind, quality):
 async def run_spotify(context, chat_id, url, quality):
     """
     Spotify download via spotDL.
-    spotDL handles: metadata from Spotify API + YouTube audio match + tags embedded.
+    spotDL reads Spotify metadata (free API) + finds best match on YouTube Music
+    + downloads + embeds all tags automatically.
     """
     status = await context.bot.send_message(
         chat_id,
-        "⏳ Fetching Spotify metadata & matching YouTube audio…\n"
-        "_This may take 30–60s per track_",
+        "⏳ Fetching Spotify metadata…\n"
+        "_Finding best audio match — may take 30–60s per track_",
         parse_mode=ParseMode.MARKDOWN,
     )
     try:
-        bitrate = f"{quality}k"
-        results, err = await spotdl_download(url, bitrate=bitrate)
+        results, err = await spotdl_download(url, quality=quality)
 
         if err:
             await status.edit_text(
-                f"❌ *Spotify/spotDL error:*\n`{err}`",
+                f"❌ *Spotify error:*\n`{err}`",
                 parse_mode=ParseMode.MARKDOWN,
             )
             return
