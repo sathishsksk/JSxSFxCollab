@@ -2,6 +2,11 @@
 helpers/jiosaavn.py — JioSaavn downloader
 API: cyberboysumanjay/JioSaavnAPI (saavnapi-nine.vercel.app)
 Response fields: title, singers, album, image_url, url, duration, lyrics
+
+NOTE on search results:
+  The /result/ endpoint caps at ~5 results per query.
+  To get more results we run multiple parallel queries (title variations,
+  artist-focused, etc.) and deduplicate by title+artist.
 """
 
 import os
@@ -11,7 +16,7 @@ import logging
 import aiohttp
 import aiofiles
 
-from config import JIOSAAVN_API, DOWNLOAD_DIR, MAX_SEARCH_RESULTS
+from config import JIOSAAVN_API, DOWNLOAD_DIR
 
 log = logging.getLogger(__name__)
 
@@ -34,8 +39,7 @@ async def _api(endpoint: str, query: str, lyrics: bool = True):
     if lyrics: params["lyrics"] = "true"
     try:
         async with aiohttp.ClientSession() as s:
-            async with s.get(url, params=params,
-                             timeout=aiohttp.ClientTimeout(total=30)) as r:
+            async with s.get(url, params=params, timeout=aiohttp.ClientTimeout(total=20)) as r:
                 if r.status != 200:
                     log.error(f"JioSaavn {r.status} {endpoint}?query={query}")
                     return None
@@ -88,60 +92,117 @@ async def fetch_playlist(url, quality="320"):
     return [s for s in (_parse(r, quality) for r in _to_list(await _api("playlist", url))) if s]
 
 
-# ── Search ────────────────────────────────────────────────────────────────────
-async def search_songs(query: str, quality: str = "320", limit: int = MAX_SEARCH_RESULTS) -> list[dict]:
-    data = await _api("result", query)
-    songs = [s for s in (_parse(r, quality) for r in _to_list(data)) if s]
-    return songs[:limit]
+# ── Multi-query search ────────────────────────────────────────────────────────
+def _make_queries(query: str) -> list[str]:
+    """
+    Generate search query variations to maximise results from the API.
+    The /result/ endpoint caps at ~5 per call, so we run multiple queries
+    with different phrasings and merge+deduplicate.
+    """
+    q  = query.strip()
+    qs = [q]
+
+    parts = q.split()
+
+    # First word only (often the song name)
+    if len(parts) >= 2:
+        qs.append(parts[0])
+
+    # First two words
+    if len(parts) >= 3:
+        qs.append(" ".join(parts[:2]))
+
+    # Last word (often artist name in "Song Artist" queries)
+    if len(parts) >= 2:
+        qs.append(parts[-1])
+
+    # Without common suffixes
+    clean = re.sub(r'\s*-\s*(from|feat|ft|remix|remaster|official)[^\-]*$', '', q, flags=re.I).strip()
+    if clean and clean != q:
+        qs.append(clean)
+
+    # Deduplicate preserving order
+    seen, result = set(), []
+    for x in qs:
+        if x and x.lower() not in seen:
+            seen.add(x.lower())
+            result.append(x)
+    return result
 
 
-async def search_albums(query: str, limit: int = 10) -> list[dict]:
-    """
-    Search JioSaavn for albums matching query.
-    Returns list of album-dicts: {title, artist, image, album_query}
-    where album_query is used to fetch all songs in that album.
-    """
+async def _search_one(query: str, quality: str) -> list[dict]:
     data = await _api("result", query)
-    songs = [s for s in (_parse(r) for r in _to_list(data)) if s]
-    # Group by album, deduplicate
+    return [s for s in (_parse(r, quality) for r in _to_list(data)) if s]
+
+
+async def search_songs(query: str, quality: str = "320", limit: int = 30) -> list[dict]:
+    """
+    Search JioSaavn with multiple query variations in parallel.
+    Deduplicates by (title, artist) and returns up to `limit` results.
+    """
+    queries = _make_queries(query)
+
+    # Run all queries in parallel
+    tasks   = [_search_one(q, quality) for q in queries]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    merged, seen = [], set()
+    for batch in results:
+        if isinstance(batch, Exception): continue
+        for s in batch:
+            key = (s["title"].lower().strip(), s["artist"].lower().strip())
+            if key not in seen:
+                seen.add(key)
+                merged.append(s)
+
+    return merged[:limit]
+
+
+async def search_albums(query: str, limit: int = 20) -> list[dict]:
+    queries = _make_queries(query)
+    tasks   = [_search_one(q) for q in queries]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
     seen, albums = set(), []
-    for s in songs:
-        alb = s.get("album", "").strip()
-        if alb and alb not in seen:
-            seen.add(alb)
-            albums.append({
-                "title":       alb,
-                "artist":      s.get("artist", ""),
-                "image":       s.get("image", ""),
-                "duration":    0,
-                "source":      "jiosaavn",
-                "result_type": "album",
-                "album_query": f"{alb} {s.get('artist','')}".strip(),
-            })
+    for batch in results:
+        if isinstance(batch, Exception): continue
+        for s in batch:
+            alb = s.get("album", "").strip()
+            if alb and alb.lower() not in seen:
+                seen.add(alb.lower())
+                albums.append({
+                    "title":       alb,
+                    "artist":      s.get("artist", ""),
+                    "image":       s.get("image", ""),
+                    "duration":    0,
+                    "source":      "jiosaavn",
+                    "result_type": "album",
+                    "album_query": f"{alb} {s.get('artist','')}".strip(),
+                })
     return albums[:limit]
 
 
-async def search_artists(query: str, limit: int = 10) -> list[dict]:
-    """
-    Search JioSaavn for artists matching query.
-    Returns list of artist-dicts grouped by primary artist.
-    """
-    data = await _api("result", query)
-    songs = [s for s in (_parse(r) for r in _to_list(data)) if s]
+async def search_artists(query: str, limit: int = 20) -> list[dict]:
+    queries = _make_queries(query)
+    tasks   = [_search_one(q) for q in queries]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
     seen, artists = set(), []
-    for s in songs:
-        art = s.get("artist", "").split(",")[0].strip()
-        if art and art not in seen:
-            seen.add(art)
-            artists.append({
-                "title":       art,
-                "artist":      art,
-                "image":       s.get("image", ""),
-                "duration":    0,
-                "source":      "jiosaavn",
-                "result_type": "artist",
-                "artist_query": art,
-            })
+    for batch in results:
+        if isinstance(batch, Exception): continue
+        for s in batch:
+            art = s.get("artist", "").split(",")[0].strip()
+            if art and art.lower() not in seen:
+                seen.add(art.lower())
+                artists.append({
+                    "title":        art,
+                    "artist":       art,
+                    "image":        s.get("image", ""),
+                    "duration":     0,
+                    "source":       "jiosaavn",
+                    "result_type":  "artist",
+                    "artist_query": art,
+                })
     return artists[:limit]
 
 
