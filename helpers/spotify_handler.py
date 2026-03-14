@@ -448,6 +448,12 @@ async def search_youtube(query: str, limit: int = MAX_SEARCH_RESULTS) -> list[di
         "extractor_args": {
             "youtube": {"player_client": ["ios"]},
         },
+    }
+    loop = asyncio.get_event_loop()
+    try:
+        def _run():
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                return ydl.extract_info(f"ytsearch{limit}:{query}", download=False)
         info = await loop.run_in_executor(None, _run)
         if not info:
             return []
