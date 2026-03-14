@@ -52,6 +52,51 @@ async def _api(endpoint: str, query: str, lyrics: bool = True):
 def _clean(s): return re.sub(r"<[^>]+>", "", str(s)).strip()
 
 
+def _clean_lyrics(raw: str) -> str:
+    """
+    Convert JioSaavn HTML lyrics to plain text with proper line breaks.
+    JioSaavn returns lyrics like:
+      "Line one<br>Line two<br><br>Verse 2<br>Line one"
+    Also handles: &amp; &quot; &#39; &nbsp; <p> tags etc.
+    """
+    if not raw:
+        return ""
+    s = raw
+    # Convert <br>, <br/>, <p>, </p> to newlines
+    s = re.sub(r"<br\s*/?>",      "\n",  s, flags=re.I)
+    s = re.sub(r"</p\s*>",        "\n",  s, flags=re.I)
+    s = re.sub(r"<p[^>]*>",       "\n",  s, flags=re.I)
+    s = re.sub(r"</?(?:div|li)[^>]*>", "\n", s, flags=re.I)
+    # Strip all remaining HTML tags
+    s = re.sub(r"<[^>]+>", "", s)
+    # Decode HTML entities
+    s = s.replace("&amp;",  "&")
+    s = s.replace("&quot;", '"')
+    s = s.replace("&#39;",  "'")
+    s = s.replace("&nbsp;", " ")
+    s = s.replace("&lt;",   "<")
+    s = s.replace("&gt;",   ">")
+    s = s.replace("&apos;", "'")
+    # Collapse 3+ consecutive newlines to 2 (paragraph break)
+    s = re.sub(r"\n{3,}", "\n\n", s)
+    # Strip leading/trailing whitespace on each line
+    lines = [line.strip() for line in s.splitlines()]
+    return "\n".join(lines).strip()
+
+
+def _max_image(url: str) -> str:
+    """
+    Force JioSaavn CDN image to highest quality (500×500).
+    JioSaavn CDN pattern: https://c.saavncdn.com/.../Name-50x50.jpg
+                                                         ^^^^^^ replace this part only
+    Only replaces the trailing NxN before the file extension — safe, no false matches.
+    """
+    if not url:
+        return url
+    # Replace NxN immediately before .jpg/.jpeg/.png/.webp at end of path
+    return re.sub(r"\d+x\d+(?=\.(jpg|jpeg|png|webp)(\?|$))", "500x500", url, flags=re.I)
+
+
 def _parse(raw: dict, quality: str = "320") -> dict | None:
     if not isinstance(raw, dict): return None
     url = raw.get("url") or raw.get("media_url") or ""
@@ -59,6 +104,7 @@ def _parse(raw: dict, quality: str = "320") -> dict | None:
     if url.startswith("//"): url = "https:" + url
     img = raw.get("image_url") or raw.get("image") or ""
     if img.startswith("//"): img = "https:" + img
+    img = _max_image(img)   # always upgrade to 500x500
     return {
         "title":    _clean(raw.get("title") or raw.get("song") or "Unknown"),
         "artist":   _clean(raw.get("singers") or raw.get("primary_artists") or ""),
@@ -66,7 +112,7 @@ def _parse(raw: dict, quality: str = "320") -> dict | None:
         "image":    img,
         "mp3_url":  url,
         "duration": int(raw.get("duration") or 0),
-        "lyrics":   raw.get("lyrics") or "",
+        "lyrics":   _clean_lyrics(raw.get("lyrics") or ""),
         "quality":  quality,
         "source":   "jiosaavn",
     }

@@ -568,8 +568,8 @@ async def download_yt(
     if not (target.startswith("http") or target.startswith("www.")):
         target = f"ytsearch1:{target}"
 
-    opts = {
-        "format":       "bestaudio/best",
+    opts_base = {
+        "format":       "bestaudio[ext=m4a]/bestaudio/best",
         "outtmpl":      out_tmpl,
         "quiet":        True,
         "no_warnings":  True,
@@ -582,21 +582,36 @@ async def download_yt(
         "http_headers": HEADERS,
         "retries":        3,
         "socket_timeout": 30,
-        "extractor_args": {
-            "youtube": {"player_client": ["ios"]},
-        },
     }
-    loop = asyncio.get_event_loop()
-    try:
-        def _run():
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                ydl.download([target])
-        await loop.run_in_executor(None, _run)
-    except Exception as e:
-        log.error(f"yt-dlp error '{target}': {e}")
-        return None
 
-    return final_path if os.path.exists(final_path) else None
+    loop      = asyncio.get_event_loop()
+    last_err  = ""
+
+    # Try multiple player clients — tv_embed and mweb are most permissive on cloud IPs
+    for player in [["tv_embed"], ["ios"], ["mweb"], ["web"]]:
+        opts = {**opts_base, "extractor_args": {"youtube": {"player_client": player}}}
+
+        # Clean up any partial files from previous attempt
+        for f in Path(DOWNLOAD_DIR).glob(f"{base}_{quality}kbps.*"):
+            try: f.unlink()
+            except OSError: pass
+
+        try:
+            def _run(t=target, o=opts):
+                with yt_dlp.YoutubeDL(o) as ydl:
+                    ydl.download([t])
+            await loop.run_in_executor(None, _run)
+            if os.path.exists(final_path):
+                return final_path
+        except Exception as e:
+            last_err = str(e)
+            log.warning(f"download_yt {player} failed: {e!s:.120}")
+            # Only retry bot-detection errors — give up on real unavailability
+            if not any(k in last_err for k in ["Sign in", "bot", "429"]):
+                break
+
+    log.error(f"download_yt all attempts failed for '{target}': {last_err:.200}")
+    return None
 
 
 # ── Genius lyrics ─────────────────────────────────────────────────────────────
