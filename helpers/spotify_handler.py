@@ -382,26 +382,28 @@ def _clean_query(s: str) -> str:
     return s.strip()
 
 
-async def download_spotify_track(song: dict, quality: str = "320") -> str:
+async def download_spotify_track(song: dict, quality: str = "320") -> tuple[str, dict]:
     """
     Download audio for a Spotify track.
+    Returns (filepath, enriched_meta) where enriched_meta has:
+      - JioSaavn metadata (correct artist, album, year, lyrics) if found there
+      - Spotify image URL (higher quality) always kept from original song dict
     Strategy:
-      1. JioSaavn search (multiple cleaned queries) — no YouTube bot issues
-      2. yt-dlp ios/tv_embed client — YouTube fallback for non-Indian tracks
+      1. JioSaavn search — no YouTube bot issues, best for Indian music
+      2. yt-dlp ios/tv_embed — YouTube fallback for non-Indian tracks
     """
-    title  = song.get("title", "") or ""
-    artist = song.get("artist", "") or ""
+    title          = song.get("title", "") or ""
+    artist         = song.get("artist", "") or ""
+    spotify_image  = song.get("image", "")   # always keep Spotify's high-res image
 
-    # Build multiple search queries from most specific to least
     clean_title = _clean_query(title)
     jio_queries = []
     if clean_title != title:
-        jio_queries.append(f"{clean_title} {artist}".strip())   # cleaned title + artist
-        jio_queries.append(clean_title)                          # cleaned title only
-    jio_queries.append(f"{title} {artist}".strip())              # original full
-    jio_queries.append(title)                                     # original title only
+        jio_queries.append(f"{clean_title} {artist}".strip())
+        jio_queries.append(clean_title)
+    jio_queries.append(f"{title} {artist}".strip())
+    jio_queries.append(title)
 
-    # Remove duplicates while preserving order
     seen = set()
     jio_queries = [q for q in jio_queries if q and not (q in seen or seen.add(q))]
 
@@ -410,9 +412,9 @@ async def download_spotify_track(song: dict, quality: str = "320") -> str:
     final_path = os.path.join(DOWNLOAD_DIR, f"{base}_{quality}kbps.mp3")
 
     if os.path.exists(final_path):
-        return final_path
+        return final_path, song
 
-    # ── Strategy 1: JioSaavn (best for Indian music, no bot issues) ──────────
+    # ── Strategy 1: JioSaavn ─────────────────────────────────────────────────
     for q in jio_queries:
         log.info(f"JioSaavn search: '{q}'")
         try:
@@ -421,17 +423,33 @@ async def download_spotify_track(song: dict, quality: str = "320") -> str:
                 jio_song = results[0]
                 jio_song["quality"] = quality
                 path = await _jio_dl(jio_song)
-                song["lyrics"] = jio_song.get("lyrics") or ""
-                log.info(f"✅ Found on JioSaavn: {jio_song.get('title')}")
+                log.info(f"✅ JioSaavn: {jio_song.get('title')} — {jio_song.get('artist')}")
+
+                # Merge: JioSaavn metadata + Spotify image (better quality)
+                enriched = {
+                    "title":        jio_song.get("title")  or title,
+                    "artist":       jio_song.get("artist") or artist,
+                    "album":        jio_song.get("album")  or song.get("album", ""),
+                    "album_artist": jio_song.get("artist") or artist,
+                    "year":         song.get("year", ""),      # Spotify has year, JioSaavn usually doesn't
+                    "genre":        song.get("genre", ""),
+                    "track_number": song.get("track_number", 0),
+                    "disc_number":  song.get("disc_number", 0),
+                    "image":        spotify_image or jio_song.get("image", ""),  # prefer Spotify 640px
+                    "duration":     jio_song.get("duration") or song.get("duration", 0),
+                    "lyrics":       jio_song.get("lyrics") or "",
+                    "source":       "spotify",
+                }
+
                 import shutil
                 shutil.move(path, final_path)
-                return final_path
+                return final_path, enriched
         except Exception as e:
             log.warning(f"JioSaavn '{q}' failed: {e}")
 
-    log.warning(f"Not found on JioSaavn, trying YouTube: {title}")
+    log.warning(f"Not on JioSaavn, trying YouTube: {title}")
 
-    # ── Strategy 2: YouTube with multiple player clients ─────────────────────
+    # ── Strategy 2: YouTube ───────────────────────────────────────────────────
     query   = f"{clean_title} {artist}".strip()
     ascii_q = unicodedata.normalize("NFKD", query).encode("ascii", "ignore").decode().strip()
 
@@ -442,7 +460,6 @@ async def download_spotify_track(song: dict, quality: str = "320") -> str:
 
     out_tmpl = os.path.join(DOWNLOAD_DIR, f"{base}_{quality}kbps.%(ext)s")
 
-    # Try multiple player clients — ios and tv_embed are least bot-blocked
     for player in [["ios"], ["tv_embed"], ["mweb"]]:
         yt_opts = {
             "format":        "bestaudio/best",
@@ -472,16 +489,19 @@ async def download_spotify_track(song: dict, quality: str = "320") -> str:
                 await loop.run_in_executor(None, _run)
                 if os.path.exists(final_path):
                     log.info(f"✅ YouTube ({player}): {title}")
-                    return final_path
+                    # Use original Spotify metadata, keep Spotify image
+                    enriched = dict(song)
+                    enriched["image"] = spotify_image or song.get("image", "")
+                    return final_path, enriched
             except Exception as e:
                 err = str(e)
-                log.warning(f"YouTube {player} failed ({target}): {err[:120]}")
+                log.warning(f"YouTube {player} ({target}): {err[:100]}")
                 if "Sign in" not in err and "bot" not in err.lower():
-                    break   # non-bot error, skip remaining targets
+                    break
 
     raise RuntimeError(
         f"'{clean_title}' not found on JioSaavn or YouTube.\n"
-        "For Indian songs, send the JioSaavn link directly for best results."
+        "For Indian songs, send the JioSaavn link directly."
     )
 
 
