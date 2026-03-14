@@ -91,27 +91,47 @@ def _extract_next_data(html: str) -> dict | None:
 
 
 def _img_url(images: list) -> str:
-    """Get largest image URL from Spotify images array."""
+    """
+    Get highest resolution image URL from Spotify images/sources array.
+    Spotify sources have: {"url": "...", "width": 640, "height": 640}
+    Width may be null — fallback: first item is usually largest (Spotify returns largest first).
+    Then apply URL hash upgrade for guaranteed max quality.
+    """
     if not images:
         return ""
-    # Sort by width descending, pick largest
-    try:
-        images = sorted(images, key=lambda x: x.get("width") or 0, reverse=True)
-    except Exception:
-        pass
-    return images[0].get("url", "") if images else ""
+    # Filter valid entries
+    valid = [i for i in images if isinstance(i, dict) and i.get("url")]
+    if not valid:
+        return ""
+    # Sort by width descending; treat None width as 0
+    valid.sort(key=lambda x: x.get("width") or x.get("height") or 0, reverse=True)
+    # Pick the largest — or first if all widths are null (Spotify returns largest first)
+    url = valid[0].get("url", "")
+    # Force max-res hash if it's a Spotify CDN URL
+    from helpers.tagger import _upgrade_image_url
+    return _upgrade_image_url(url)
 
 
-def _track_entry(name: str, artists: list, album: str, image: str, duration_ms: int) -> dict:
-    artist_str = ", ".join(a.get("name","") for a in artists)
+def _track_entry(
+    name: str, artists: list, album: str, image: str, duration_ms: int,
+    year: str = "", genre: str = "", track_number: int = 0, disc_number: int = 0,
+) -> dict:
+    artist_str = ", ".join(
+        a.get("name", "") if isinstance(a, dict) else str(a)
+        for a in (artists or [])
+    )
     return {
-        "title":    name,
-        "artist":   artist_str,
-        "album":    album,
-        "image":    image,
-        "duration": int(duration_ms / 1000),
-        "source":   "spotify",
-        "lyrics":   "",
+        "title":        name,
+        "artist":       artist_str,
+        "album":        album,
+        "image":        image,
+        "duration":     int(duration_ms / 1000),
+        "year":         year,
+        "genre":        genre,
+        "track_number": track_number,
+        "disc_number":  disc_number,
+        "source":       "spotify",
+        "lyrics":       "",
     }
 
 
@@ -156,7 +176,21 @@ def _parse_track(data: dict) -> list[dict]:
         elif not isinstance(duration, int):
             duration = 0
 
-        return [_track_entry(name, artists, album_name, _img_url(images), duration)]
+        # Extra metadata
+        year         = ""
+        track_number = 0
+        disc_number  = 0
+        if isinstance(album, dict):
+            date = album.get("date", {})
+            if isinstance(date, dict):
+                year = str(date.get("year", "") or "")
+            elif isinstance(date, str):
+                year = date[:4]
+        track_number = int(entity.get("trackNumber") or 0)
+        disc_number  = int(entity.get("discNumber") or 0)
+
+        return [_track_entry(name, artists, album_name, _img_url(images), duration,
+                             year=year, track_number=track_number, disc_number=disc_number)]
     except Exception as e:
         log.error(f"_parse_track error: {e}")
         return []
