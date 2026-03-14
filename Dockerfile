@@ -1,6 +1,5 @@
 FROM python:3.11-slim
 
-# FFmpeg required by yt-dlp for audio encoding (128/320 kbps)
 RUN apt-get update && \
     apt-get install -y --no-install-recommends ffmpeg && \
     apt-get clean && rm -rf /var/lib/apt/lists/*
