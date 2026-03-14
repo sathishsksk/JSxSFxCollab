@@ -701,8 +701,19 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text    = (update.message.text or "").strip()
     if not text: return
+
     chat_id = update.effective_chat.id
-    mid     = str(update.message.message_id)
+    user_id = update.effective_user.id
+    msg_id  = update.message.message_id
+
+    # Unique key: chat + user + message — prevents collision in group chats
+    mid = f"{chat_id}_{user_id}_{msg_id}"
+
+    # In groups: strip bot mention if present (@BotName text → text)
+    bot_username = (await context.bot.get_me()).username
+    if f"@{bot_username}" in text:
+        text = text.replace(f"@{bot_username}", "").strip()
+    if not text: return
 
     jio_kind = detect_jiosaavn(text)
     sp_kind  = detect_spotify(text)
@@ -778,7 +789,7 @@ async def main():
         await app.start()
         await app.updater.start_polling(
             drop_pending_updates=True,
-            allowed_updates=["message", "callback_query"],
+            allowed_updates=["message", "callback_query", "edited_message"],
         )
         log.info("Bot running.")
         await asyncio.Event().wait()
