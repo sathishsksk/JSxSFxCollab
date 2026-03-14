@@ -24,6 +24,7 @@ from pathlib import Path
 
 import aiohttp
 import yt_dlp
+from helpers.jiosaavn import search_songs as _jio_search, download_and_encode as _jio_dl
 
 from config import (
     GENIUS_ACCESS_TOKEN, DOWNLOAD_DIR,
@@ -333,106 +334,120 @@ def _safe_fn(s: str) -> str:
     return re.sub(r'[<>:"/\\|?*\n\r\t]', "", s).strip()[:80]
 
 
+def _clean_query(s: str) -> str:
+    """
+    Clean a Spotify title for search.
+    Removes: (feat. X), - From "Album", [Remix], quotes, extra hyphens.
+    Example: 'Ayalathe Veettile - From "Matinee"' → 'Ayalathe Veettile'
+    """
+    s = re.sub(r'\s*-\s*[Ff]rom\s+"[^"]+"', "", s)   # remove: - From "Album"
+    s = re.sub(r'\s*-\s*[Ff]rom\s+\S+',     "", s)   # remove: - From Album
+    s = re.sub(r'\s*[\(\[](feat|ft|with|remix|remaster)[^\)\]]*[\)\]]', "", s, flags=re.I)
+    s = re.sub(r'["\']', "", s)                        # remove quotes
+    s = re.sub(r'\s{2,}', " ", s)
+    return s.strip()
+
+
 async def download_spotify_track(song: dict, quality: str = "320") -> str:
     """
     Download audio for a Spotify track.
-
     Strategy:
-      1. JioSaavn search  ← best for Indian/Tamil/Malayalam songs, NO YouTube bot issues
-      2. yt-dlp ios client ← YouTube fallback for non-Indian tracks
-
-    JioSaavn is preferred because:
-      - Koyeb/Railway/Fly IPs are blocked by YouTube bot detection
-      - JioSaavn has the largest Indian music catalogue
-      - JioSaavn downloads are direct HTTP — no bot issues ever
+      1. JioSaavn search (multiple cleaned queries) — no YouTube bot issues
+      2. yt-dlp ios/tv_embed client — YouTube fallback for non-Indian tracks
     """
-    from helpers.jiosaavn import search_songs, download_and_encode
-
     title  = song.get("title", "") or ""
     artist = song.get("artist", "") or ""
-    query  = f"{title} {artist}".strip()
+
+    # Build multiple search queries from most specific to least
+    clean_title = _clean_query(title)
+    jio_queries = []
+    if clean_title != title:
+        jio_queries.append(f"{clean_title} {artist}".strip())   # cleaned title + artist
+        jio_queries.append(clean_title)                          # cleaned title only
+    jio_queries.append(f"{title} {artist}".strip())              # original full
+    jio_queries.append(title)                                     # original title only
+
+    # Remove duplicates while preserving order
+    seen = set()
+    jio_queries = [q for q in jio_queries if q and not (q in seen or seen.add(q))]
 
     os.makedirs(DOWNLOAD_DIR, exist_ok=True)
-    base       = _safe_fn(f"{artist} - {title}" if artist else title)
+    base       = _safe_fn(f"{artist} - {clean_title}" if artist else clean_title)
     final_path = os.path.join(DOWNLOAD_DIR, f"{base}_{quality}kbps.mp3")
 
     if os.path.exists(final_path):
         return final_path
 
-    # ── Strategy 1: JioSaavn search (no YouTube, no bot issues) ──────────────
-    log.info(f"Spotify→JioSaavn search: {query}")
-    try:
-        jio_results = await search_songs(query, quality=quality, limit=1)
-        if not jio_results:
-            # Try title only (in case artist name is in English but song is regional)
-            jio_results = await search_songs(title, quality=quality, limit=1)
-
-        if jio_results:
-            jio_song = jio_results[0]
-            jio_song["quality"] = quality
-            path = await download_and_encode(jio_song)
-            # Override metadata with Spotify info (better cover art, album etc)
-            song["lyrics"] = jio_song.get("lyrics") or song.get("lyrics") or ""
-            log.info(f"✅ Spotify track via JioSaavn: {title}")
-            # Rename to expected final_path
-            if path != final_path:
+    # ── Strategy 1: JioSaavn (best for Indian music, no bot issues) ──────────
+    for q in jio_queries:
+        log.info(f"JioSaavn search: '{q}'")
+        try:
+            results = await _jio_search(q, quality=quality, limit=1)
+            if results:
+                jio_song = results[0]
+                jio_song["quality"] = quality
+                path = await _jio_dl(jio_song)
+                song["lyrics"] = jio_song.get("lyrics") or ""
+                log.info(f"✅ Found on JioSaavn: {jio_song.get('title')}")
                 import shutil
                 shutil.move(path, final_path)
-            return final_path
-    except Exception as e:
-        log.warning(f"JioSaavn fallback failed for '{title}': {e}")
+                return final_path
+        except Exception as e:
+            log.warning(f"JioSaavn '{q}' failed: {e}")
 
-    # ── Strategy 2: yt-dlp with ios player client ─────────────────────────────
-    # ios client is the most reliable for bypassing YouTube bot checks on cloud IPs
-    log.info(f"Spotify→YouTube (ios client): {query}")
+    log.warning(f"Not found on JioSaavn, trying YouTube: {title}")
 
+    # ── Strategy 2: YouTube with multiple player clients ─────────────────────
+    query   = f"{clean_title} {artist}".strip()
     ascii_q = unicodedata.normalize("NFKD", query).encode("ascii", "ignore").decode().strip()
+
     yt_targets = [f"ytsearch1:{query}"]
     if ascii_q and ascii_q != query:
         yt_targets.append(f"ytsearch1:{ascii_q}")
-    yt_targets.append(f"ytsearch1:{title}")
+    yt_targets.append(f"ytsearch1:{clean_title}")
 
     out_tmpl = os.path.join(DOWNLOAD_DIR, f"{base}_{quality}kbps.%(ext)s")
-    yt_opts  = {
-        "format":        "bestaudio/best",
-        "outtmpl":       out_tmpl,
-        "quiet":         True,
-        "no_warnings":   True,
-        "noplaylist":    True,
-        "postprocessors": [{
-            "key":              "FFmpegExtractAudio",
-            "preferredcodec":   "mp3",
-            "preferredquality": quality,
-        }],
-        "http_headers":  HEADERS,
-        "retries":       3,
-        "socket_timeout": 30,
-        "extractor_args": {
-            "youtube": {"player_client": ["ios"]},   # ios bypasses bot check on cloud IPs
-        },
-    }
 
-    loop = asyncio.get_event_loop()
-    last_err = ""
-    for target in yt_targets:
-        for f in Path(DOWNLOAD_DIR).glob(f"{base}_{quality}kbps.*"):
-            try: f.unlink()
-            except OSError: pass
-        try:
-            def _run(t=target):
-                with yt_dlp.YoutubeDL(yt_opts) as ydl:
-                    ydl.download([t])
-            await loop.run_in_executor(None, _run)
-            if os.path.exists(final_path):
-                log.info(f"✅ Spotify track via YouTube: {title}")
-                return final_path
-        except Exception as e:
-            last_err = str(e)
-            log.warning(f"YouTube failed ({target}): {e}")
+    # Try multiple player clients — ios and tv_embed are least bot-blocked
+    for player in [["ios"], ["tv_embed"], ["mweb"]]:
+        yt_opts = {
+            "format":        "bestaudio/best",
+            "outtmpl":       out_tmpl,
+            "quiet":         True,
+            "no_warnings":   True,
+            "noplaylist":    True,
+            "postprocessors": [{
+                "key":              "FFmpegExtractAudio",
+                "preferredcodec":   "mp3",
+                "preferredquality": quality,
+            }],
+            "http_headers":  HEADERS,
+            "retries":       2,
+            "socket_timeout": 30,
+            "extractor_args": {"youtube": {"player_client": player}},
+        }
+        loop = asyncio.get_event_loop()
+        for target in yt_targets:
+            for f in Path(DOWNLOAD_DIR).glob(f"{base}_{quality}kbps.*"):
+                try: f.unlink()
+                except OSError: pass
+            try:
+                def _run(t=target, o=yt_opts):
+                    with yt_dlp.YoutubeDL(o) as ydl:
+                        ydl.download([t])
+                await loop.run_in_executor(None, _run)
+                if os.path.exists(final_path):
+                    log.info(f"✅ YouTube ({player}): {title}")
+                    return final_path
+            except Exception as e:
+                err = str(e)
+                log.warning(f"YouTube {player} failed ({target}): {err[:120]}")
+                if "Sign in" not in err and "bot" not in err.lower():
+                    break   # non-bot error, skip remaining targets
 
     raise RuntimeError(
-        f"Could not download: {title}\n"
-        f"Tried JioSaavn + YouTube. Last error: {last_err}"
+        f"'{clean_title}' not found on JioSaavn or YouTube.\n"
+        "For Indian songs, send the JioSaavn link directly for best results."
     )
 
 
