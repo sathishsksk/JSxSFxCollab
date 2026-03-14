@@ -757,14 +757,30 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ══════════════════════════════════════════════════════════════════════════════
 async def _health(_): return web.Response(text="OK")
 
+async def _keep_alive(app_url: str):
+    """Ping own health endpoint every 5 min to prevent Koyeb sleep."""
+    await asyncio.sleep(60)   # wait for server to start first
+    async with aiohttp.ClientSession() as session:
+        while True:
+            try:
+                await session.get(f"{app_url}/health", timeout=aiohttp.ClientTimeout(total=10))
+                log.info("Keep-alive ping sent")
+            except Exception as e:
+                log.warning(f"Keep-alive ping failed: {e}")
+            await asyncio.sleep(300)   # every 5 minutes
+
 async def start_health():
-    app = web.Application()
-    app.router.add_get("/health", _health)
-    app.router.add_get("/",       _health)
-    runner = web.AppRunner(app)
+    app_url = os.environ.get("APP_URL", "").rstrip("/")
+    webapp = web.Application()
+    webapp.router.add_get("/health", _health)
+    webapp.router.add_get("/",       _health)
+    runner = web.AppRunner(webapp)
     await runner.setup()
     await web.TCPSite(runner, "0.0.0.0", PORT).start()
     log.info(f"Health server on :{PORT}")
+    if app_url:
+        asyncio.create_task(_keep_alive(app_url))
+        log.info(f"Keep-alive enabled → {app_url}")
 
 
 # ══════════════════════════════════════════════════════════════════════════════

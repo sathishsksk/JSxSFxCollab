@@ -17,6 +17,7 @@ MAX_PLAYLIST_SONGS  = int(os.environ.get("MAX_PLAYLIST_SONGS", 25))
 MAX_SEARCH_RESULTS  = int(os.environ.get("MAX_SEARCH_RESULTS", 6))
 DOWNLOAD_DIR        = "/tmp/musicbot"
 PORT                = int(os.environ.get("PORT", 8080))
+APP_URL             = os.environ.get("APP_URL", "")   # e.g. https://your-app.koyeb.app
 
 # NOTE: No Spotify API keys needed at all.
 # Spotify works by scraping open.spotify.com public web pages.
