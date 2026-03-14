@@ -118,11 +118,17 @@ async def _dl_send_yt(context, chat_id, song: dict, quality: str):
 
 
 async def _dl_send_spotify(context, chat_id, song: dict, quality: str):
-    """Download a Spotify track via YouTube Music match, embed Spotify metadata."""
-    path = await download_spotify_track(song, quality=quality)
-    lyrics = await get_lyrics(song.get("title",""), song.get("artist",""))
-    await tag_mp3(path, song, lyrics=lyrics)
-    await send_audio(context, chat_id, path, song, quality)
+    """
+    Download a Spotify track and send with full metadata.
+    download_spotify_track returns (path, enriched_meta) where enriched_meta
+    has JioSaavn artist/album/lyrics merged with Spotify's high-res image.
+    """
+    path, enriched = await download_spotify_track(song, quality=quality)
+    lyrics = enriched.get("lyrics") or await get_lyrics(
+        enriched.get("title", ""), enriched.get("artist", "")
+    )
+    await tag_mp3(path, enriched, lyrics=lyrics)
+    await send_audio(context, chat_id, path, enriched, quality)
     cleanup(path)
 
 
