@@ -44,16 +44,6 @@ JIO_TYPES   = {"songs": "Songs", "albums": "Albums", "artists": "Artists"}
 JIO_ICONS   = {"songs": "🎶", "albums": "💿", "artists": "🎤"}
 
 # Suggested related search terms appended to query for more variety
-def _suggest_terms(query: str) -> list[str]:
-    """Return related search suggestion chips based on query."""
-    q = query.strip()
-    suggestions = []
-    # Add common related suffixes people search for
-    for suffix in ["songs", "hits", "album", "latest", "best of", "playlist"]:
-        if suffix.lower() not in q.lower():
-            suggestions.append(f"{q} {suffix}")
-    return suggestions[:4]
-
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  UTILITIES
@@ -258,21 +248,6 @@ def _build_search_kbd(results: list[dict], sid: str, source: str, jio_type: str,
         ))
     buttons.append(src_row)
 
-    # ── Related suggestions ───────────────────────────────────────────────────
-    if query and page == 0:
-        suggestions = _suggest_terms(query)
-        if suggestions:
-            # Split into rows of 2
-            for i in range(0, min(len(suggestions), 4), 2):
-                row = []
-                for sug in suggestions[i:i+2]:
-                    short = sug if len(sug) <= 22 else sug[:19] + "…"
-                    row.append(InlineKeyboardButton(
-                        f"🔍 {short}",
-                        callback_data=f"suggest|{sid}|{sug[:40]}",
-                    ))
-                buttons.append(row)
-
     # ── Pagination ────────────────────────────────────────────────────────────
     if total_pages > 1:
         pg_row = []
@@ -358,24 +333,6 @@ async def run_search(context, chat_id: int, query: str, sid: str):
 # ══════════════════════════════════════════════════════════════════════════════
 #  CALLBACK HANDLERS
 # ══════════════════════════════════════════════════════════════════════════════
-async def on_suggestion(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """User taps a related suggestion chip — re-search with that query."""
-    cb = update.callback_query
-    await cb.answer()
-    _, sid, new_query = cb.data.split("|", 2)
-
-    sess = _sess(context, sid)
-    if not sess:
-        await cb.edit_message_text("Session expired. Search again.")
-        return
-
-    sess["query"]    = new_query
-    sess["page"]     = 0
-    sess["cache"]    = {}   # clear cache for new query
-    _save(context, sid, sess)
-    await _render_search(context, update.effective_chat.id, sid, msg_id=cb.message.message_id)
-
-
 async def on_noop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.callback_query.answer()
 
@@ -828,7 +785,6 @@ async def main():
     app.add_handler(CommandHandler("help",  cmd_help))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
     app.add_handler(CallbackQueryHandler(on_noop,         pattern=r"^noop$"))
-    app.add_handler(CallbackQueryHandler(on_suggestion,   pattern=r"^suggest\|"))
     app.add_handler(CallbackQueryHandler(on_source_switch, pattern=r"^src\|"))
     app.add_handler(CallbackQueryHandler(on_jio_type,      pattern=r"^jtype\|"))
     app.add_handler(CallbackQueryHandler(on_page,          pattern=r"^pg\|"))
