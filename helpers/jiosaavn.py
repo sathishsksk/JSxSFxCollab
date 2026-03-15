@@ -176,7 +176,7 @@ def _make_queries(query: str) -> list[str]:
     return result
 
 
-async def _search_one(query: str, quality: str) -> list[dict]:
+async def _search_one(query: str, quality: str = "320") -> list[dict]:
     data = await _api("result", query)
     return [s for s in (_parse(r, quality) for r in _to_list(data)) if s]
 
