@@ -131,8 +131,18 @@ def _to_list(data) -> list:
 async def fetch_song(url, quality="320"):
     return [s for s in (_parse(r, quality) for r in _to_list(await _api("song", url))) if s]
 
-async def fetch_album(url, quality="320"):
-    return [s for s in (_parse(r, quality) for r in _to_list(await _api("album", url))) if s]
+async def fetch_album(url_or_query, quality="320"):
+    data = await _api("album", url_or_query)
+    
+    # Vercel API returned search results instead of songs → re-fetch using album URL
+    if isinstance(data, dict) and "results" in data and "songs" not in data:
+        try:
+            album_url = data["results"][0]["perma_url"]
+            data = await _api("album", album_url)
+        except (KeyError, IndexError):
+            pass
+    
+    return [s for s in (_parse(r, quality) for r in _to_list(data)) if s]
 
 async def fetch_playlist(url, quality="320"):
     return [s for s in (_parse(r, quality) for r in _to_list(await _api("playlist", url))) if s]
