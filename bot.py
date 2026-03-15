@@ -23,6 +23,7 @@ from config import BOT_TOKEN, BOT_ID, PORT, DOWNLOAD_DIR, MAX_PLAYLIST_SONGS, MA
 from helpers.jiosaavn import (
     detect_jiosaavn, fetch_song, fetch_album, fetch_playlist,
     search_songs, search_albums, search_artists, download_and_encode,
+    warmup_api,
 )
 from helpers.spotify_handler import (
     detect_spotify, is_youtube,
@@ -775,6 +776,7 @@ async def start_health():
 # ══════════════════════════════════════════════════════════════════════════════
 async def main():
     await start_health()
+    await warmup_api()   # FIX 5: wake Vercel API before first user hits it
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help",  cmd_help))
