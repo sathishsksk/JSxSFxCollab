@@ -129,7 +129,19 @@ async def fetch_song(url, quality="320"):
     return [s for s in (_parse(r, quality) for r in _to_list(await _api("song", url, lyrics=True))) if s]
 
 async def fetch_album(url_or_query, quality="320"):
+    # If JioSaavn album URL, extract name from slug as fallback
+    # e.g. ".../thirudan-police-original-motion-picture-soundtrack/ID"
+    # → "thirudan police original motion picture soundtrack"
+    fallback_name = None
+    if url_or_query.startswith("http") and "/album/" in url_or_query:
+        try:
+            slug = url_or_query.rstrip("/").rsplit("/", 2)[-2]
+            fallback_name = " ".join(slug.split("-")[:5])  # first 5 words of slug
+        except Exception:
+            pass
+
     data = await _api("album", url_or_query)
+
     # Vercel returned search results instead of songs → re-fetch with album URL
     if isinstance(data, dict) and "results" in data and "songs" not in data:
         try:
@@ -137,8 +149,23 @@ async def fetch_album(url_or_query, quality="320"):
             data = await _api("album", album_url)
         except (KeyError, IndexError):
             pass
-    return [s for s in (_parse(r, quality) for r in _to_list(data)) if s]
 
+    songs = [s for s in (_parse(r, quality) for r in _to_list(data)) if s]
+
+    # _api returned None (Vercel timeout/500) → fallback to name search
+    if not songs and fallback_name:
+        log.warning(f"fetch_album URL failed, retrying with name: '{fallback_name}'")
+        data = await _api("album", fallback_name)
+        if isinstance(data, dict) and "results" in data and "songs" not in data:
+            try:
+                album_url = data["results"][0]["perma_url"]
+                data = await _api("album", album_url)
+            except (KeyError, IndexError):
+                pass
+        songs = [s for s in (_parse(r, quality) for r in _to_list(data)) if s]
+
+    return songs
+  
 async def fetch_playlist(url, quality="320"):
     return [s for s in (_parse(r, quality) for r in _to_list(await _api("playlist", url))) if s]
 
