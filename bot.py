@@ -430,12 +430,7 @@ async def on_search_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if album_url:
             songs = await fetch_album(album_url)
         else:
-            songs = await search_songs(album_q, limit=30)
-            # Filter to only songs that match the album name
-            album_name = item.get("title", "").lower()
-            matching   = [s for s in songs if album_name in s.get("album","").lower()]
-            if matching:
-                songs = matching
+            songs = await fetch_album(album_q)  # ← plain text now works via Vercel API
 
         await status.delete()
         if not songs:
