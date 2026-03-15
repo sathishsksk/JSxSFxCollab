@@ -206,7 +206,7 @@ async def search_songs(query: str, quality: str = "320", limit: int = 30) -> lis
 
 async def search_albums(query: str, limit: int = 20) -> list[dict]:
     queries = _make_queries(query)
-    tasks   = [_search_one(q) for q in queries]
+    tasks   = [_search_one(q, "320") for q in queries]
     results = await asyncio.gather(*tasks, return_exceptions=True)
 
     seen, albums = set(), []
